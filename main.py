@@ -382,41 +382,41 @@ def parse_off_product(p: dict) -> dict:
 
 @app.get("/api/food/search")
 async def search_food(q: str, user_id: int = Header(..., alias="X-User-Id")):
-    """Поиск еды через Open Food Facts API v2."""
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            # Пробуем новый API v2
-            resp = await client.get(
-                "https://world.openfoodfacts.org/api/v2/search",
-                params={
-                    "search_terms": q,
-                    "page_size": 15,
-                    "fields": "id,product_name,product_name_ru,product_name_en,brands,nutriments",
-                    "sort_by": "unique_scans_n",
-                },
-                headers={"User-Agent": "PlannerApp/1.0 (contact@example.com)"}
-            )
-            logging.warning(f"OFF search status: {resp.status_code}, url: {resp.url}")
-            resp.raise_for_status()
-            data = resp.json()
-
-        products = data.get("products", [])
-        logging.warning(f"OFF products count: {len(products)}")
-        
-        results = []
-        for p in products:
-            item = parse_off_product(p)
-            if not item["food_name"] or item["food_name"] == "Неизвестный продукт":
-                continue
-            results.append(item)
-
-        return {"results": results[:10]}
-    except httpx.ConnectError as e:
-        logging.error(f"Connect error: {e}")
-        raise HTTPException(503, f"Cannot connect to food database: {str(e)}")
-    except Exception as e:
-        logging.error(f"Search error: {type(e).__name__}: {e}")
-        raise HTTPException(500, f"Search error: {type(e).__name__}: {str(e)}")
+    """Поиск еды через Open Food Facts — пробуем несколько эндпоинтов."""
+    urls = [
+        ("https://world.openfoodfacts.org/cgi/search.pl", {
+            "search_terms": q, "search_simple": 1, "action": "process",
+            "json": 1, "page_size": 15, "sort_by": "unique_scans_n",
+            "fields": "id,product_name,product_name_ru,product_name_en,brands,nutriments",
+        }),
+        ("https://world.openfoodfacts.net/cgi/search.pl", {
+            "search_terms": q, "search_simple": 1, "action": "process",
+            "json": 1, "page_size": 15,
+            "fields": "id,product_name,product_name_ru,product_name_en,brands,nutriments",
+        }),
+    ]
+    last_err = None
+    for url, params in urls:
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                resp = await client.get(url, params=params,
+                    headers={"User-Agent": "PlannerApp/1.0"})
+                logging.warning(f"OFF [{resp.status_code}] {url}")
+                if resp.status_code >= 500:
+                    last_err = f"OFF returned {resp.status_code}"
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+            products = data.get("products", [])
+            results = [parse_off_product(p) for p in products
+                       if p.get("product_name") or p.get("product_name_ru")]
+            results = [r for r in results if r["food_name"] != "Неизвестный продукт"]
+            return {"results": results[:10]}
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            logging.error(f"OFF error on {url}: {last_err}")
+            continue
+    raise HTTPException(503, f"Food search unavailable: {last_err}")
 
 
 @app.get("/api/food/barcode")
