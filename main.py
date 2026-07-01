@@ -15,12 +15,9 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-FATSECRET_CLIENT_ID = os.environ.get("FATSECRET_CLIENT_ID", "")
-FATSECRET_CLIENT_SECRET = os.environ.get("FATSECRET_CLIENT_SECRET", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 pool: Optional[asyncpg.Pool] = None
-fs_token_cache: dict = {}  # {"token": "...", "expires_at": timestamp}
 import logging
 
 
@@ -360,165 +357,82 @@ async def upsert_body_calories(b: "BodyCalIn", user_id: int = Header(..., alias=
 
 
 # ════════════════════════════════════════════════════════════════
-# FATSECRET — поиск и лог питания
+# ПИТАНИЕ — Open Food Facts (бесплатно, без ключей)
 # ════════════════════════════════════════════════════════════════
-async def get_fatsecret_token() -> str:
-    """Получаем OAuth2 токен FatSecret (client_credentials). Кешируем."""
-    import time
-    now = time.time()
-    if fs_token_cache.get("token") and fs_token_cache.get("expires_at", 0) > now + 60:
-        return fs_token_cache["token"]
+# ════════════════════════════════════════════════════════════════
+# OPEN FOOD FACTS — бесплатно, без ключей, есть русские продукты
+# ════════════════════════════════════════════════════════════════
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://oauth.fatsecret.com/connect/token",
-            data={
-                "grant_type": "client_credentials",
-            },
-            auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        logging.warning(f"FatSecret token response: {resp.status_code} {resp.text[:200]}")
-        resp.raise_for_status()
-        data = resp.json()
-        fs_token_cache["token"] = data["access_token"]
-        fs_token_cache["expires_at"] = now + data.get("expires_in", 86400)
-        return fs_token_cache["token"]
+def parse_off_product(p: dict) -> dict:
+    """Парсим продукт из Open Food Facts в наш формат."""
+    nutriments = p.get("nutriments", {})
+    name = (p.get("product_name_ru") or p.get("product_name") or p.get("product_name_en") or "").strip()
+    brand = p.get("brands", "").split(",")[0].strip()
+    return {
+        "food_id": p.get("_id", p.get("id", "")),
+        "food_name": name or "Неизвестный продукт",
+        "brand_name": brand,
+        "serving_desc": "на 100г",
+        "calories": round(float(nutriments.get("energy-kcal_100g") or nutriments.get("energy_100g", 0) or 0), 1),
+        "protein":  round(float(nutriments.get("proteins_100g", 0) or 0), 1),
+        "fat":      round(float(nutriments.get("fat_100g", 0) or 0), 1),
+        "carbs":    round(float(nutriments.get("carbohydrates_100g", 0) or 0), 1),
+    }
 
 
 @app.get("/api/food/search")
 async def search_food(q: str, user_id: int = Header(..., alias="X-User-Id")):
-    """Поиск еды через FatSecret API."""
-    if not FATSECRET_CLIENT_ID:
-        raise HTTPException(503, "FatSecret not configured")
+    """Поиск еды через Open Food Facts API."""
     try:
-        token = await get_fatsecret_token()
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
-                "https://platform.fatsecret.com/rest/server.api",
+                "https://world.openfoodfacts.org/cgi/search.pl",
                 params={
-                    "method": "foods.search",
-                    "search_expression": q,
-                    "format": "json",
-                    "max_results": 10,
+                    "search_terms": q,
+                    "search_simple": 1,
+                    "action": "process",
+                    "json": 1,
+                    "page_size": 15,
+                    "fields": "id,product_name,product_name_ru,product_name_en,brands,nutriments",
+                    "sort_by": "unique_scans_n",
                 },
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"User-Agent": "PlannerApp/1.0"}
             )
             resp.raise_for_status()
             data = resp.json()
-            logging.warning(f"FatSecret full response: {str(data)[:500]}")
 
-        # Проверяем на ошибку
-        if "error" in data:
-            raise HTTPException(400, f"FatSecret error: {data['error']}")
-
-        # Обрабатываем разные форматы ответа
-        foods_data = data.get("foods", {})
-        if not foods_data:
-            return {"results": []}
-        
-        foods = foods_data.get("food", [])
-        if isinstance(foods, dict):
-            foods = [foods]
-        if not foods:
-            return {"results": []}
-
+        products = data.get("products", [])
         results = []
-        for item in foods:
-            desc = item.get("food_description", "")
-            nutrition = {"calories": 0, "fat": 0, "carbs": 0, "protein": 0}
-            
-            # Парсим "Per 100g - Calories: 89kcal | Fat: 0.33g | Carbs: 23g | Protein: 1.09g"
-            try:
-                for part in desc.split("|"):
-                    part = part.strip()
-                    if "Calories:" in part:
-                        val = part.split("Calories:")[-1].replace("kcal", "").strip()
-                        nutrition["calories"] = round(float(val), 1)
-                    elif "Fat:" in part:
-                        val = part.split("Fat:")[-1].replace("g", "").strip()
-                        nutrition["fat"] = round(float(val), 1)
-                    elif "Carbs:" in part:
-                        val = part.split("Carbs:")[-1].replace("g", "").strip()
-                        nutrition["carbs"] = round(float(val), 1)
-                    elif "Protein:" in part:
-                        val = part.split("Protein:")[-1].replace("g", "").strip()
-                        nutrition["protein"] = round(float(val), 1)
-            except (ValueError, IndexError):
-                pass
+        for p in products:
+            item = parse_off_product(p)
+            # Пропускаем продукты без названия или калорий
+            if not item["food_name"] or item["food_name"] == "Неизвестный продукт":
+                continue
+            results.append(item)
 
-            results.append({
-                "food_id": str(item.get("food_id", "")),
-                "food_name": item.get("food_name", ""),
-                "food_type": item.get("food_type", ""),
-                "brand_name": item.get("brand_name", ""),
-                "serving_desc": desc,
-                **nutrition,
-            })
-
-        return {"results": results}
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(e.response.status_code, f"FatSecret API error: {e.response.text}")
+        return {"results": results[:10]}
     except Exception as e:
-        raise HTTPException(500, f"FatSecret error: {str(e)}")
+        raise HTTPException(500, f"Search error: {str(e)}")
 
 
 @app.get("/api/food/barcode")
 async def search_by_barcode(barcode: str, user_id: int = Header(..., alias="X-User-Id")):
-    """Поиск еды по штрихкоду через FatSecret API."""
-    if not FATSECRET_CLIENT_ID:
-        raise HTTPException(503, "FatSecret not configured")
+    """Поиск еды по штрихкоду через Open Food Facts."""
     try:
-        token = await get_fatsecret_token()
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
-                "https://platform.fatsecret.com/rest/server.api",
-                params={
-                    "method": "food.find_id_for_barcode",
-                    "barcode": barcode,
-                    "format": "json",
-                },
-                headers={"Authorization": f"Bearer {token}"},
+                f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json",
+                headers={"User-Agent": "PlannerApp/1.0"}
             )
             resp.raise_for_status()
             data = resp.json()
-        
-        food_id = data.get("food_id", {}).get("value")
-        if not food_id:
+
+        if data.get("status") != 1:
             return {"results": []}
-        
-        # Получаем детали продукта
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp2 = await client.get(
-                "https://platform.fatsecret.com/rest/server.api",
-                params={
-                    "method": "food.get.v4",
-                    "food_id": food_id,
-                    "format": "json",
-                },
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            resp2.raise_for_status()
-            food_data = resp2.json()
-        
-        food = food_data.get("food", {})
-        servings = food.get("servings", {}).get("serving", [])
-        if isinstance(servings, dict):
-            servings = [servings]
-        
-        # Берём первый вариант порции (обычно 100г)
-        s = servings[0] if servings else {}
-        
-        return {"results": [{
-            "food_id": str(food_id),
-            "food_name": food.get("food_name", ""),
-            "brand_name": food.get("brand_name", ""),
-            "serving_desc": s.get("serving_description", "100г"),
-            "calories": round(float(s.get("calories", 0)), 1),
-            "protein": round(float(s.get("protein", 0)), 1),
-            "fat": round(float(s.get("fat", 0)), 1),
-            "carbs": round(float(s.get("carbohydrate", 0)), 1),
-        }]}
+
+        product = data.get("product", {})
+        item = parse_off_product(product)
+        return {"results": [item]}
     except Exception as e:
         raise HTTPException(500, f"Barcode error: {str(e)}")
 
