@@ -399,13 +399,13 @@ async def search_food(q: str, user_id: int = Header(..., alias="X-User-Id")):
                     "search_expression": q,
                     "format": "json",
                     "max_results": 10,
-                    "language": "ru",
-                    "region": "RU",
                 },
                 headers={"Authorization": f"Bearer {token}"},
             )
             resp.raise_for_status()
             data = resp.json()
+            import logging
+            logging.warning(f"FatSecret response keys: {list(data.keys())}, foods: {str(data.get('foods','NO_FOODS'))[:200]}")
 
         # Обрабатываем разные форматы ответа
         foods_data = data.get("foods", {})
