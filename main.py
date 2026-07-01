@@ -1,17 +1,10 @@
 """
 FastAPI backend для Telegram Mini App "Мой планировщик"
-Хранит данные в PostgreSQL (Supabase), привязка к telegram_user_id.
-
-Запуск локально:
-    pip install -r requirements.txt
-    uvicorn main:app --reload
-
-Переменные окружения (.env):
-    DATABASE_URL=postgresql://user:pass@host:port/dbname
 """
 
 import os
 import json
+import httpx
 from datetime import date
 from typing import Optional
 
@@ -22,8 +15,12 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+FATSECRET_CLIENT_ID = os.environ.get("FATSECRET_CLIENT_ID", "")
+FATSECRET_CLIENT_SECRET = os.environ.get("FATSECRET_CLIENT_SECRET", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 pool: Optional[asyncpg.Pool] = None
+fs_token_cache: dict = {}  # {"token": "...", "expires_at": timestamp}
 
 
 @asynccontextmanager
@@ -39,7 +36,7 @@ app = FastAPI(title="Planner API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # для Mini App ограничь на свой vercel-домен в проде
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -110,66 +107,24 @@ async def init_db():
                 calories INT NOT NULL,
                 PRIMARY KEY (user_id, date)
             );
+
+            CREATE TABLE IF NOT EXISTS food_log (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                date DATE NOT NULL,
+                meal_type TEXT NOT NULL,
+                food_id TEXT NOT NULL,
+                food_name TEXT NOT NULL,
+                serving_desc TEXT,
+                calories NUMERIC,
+                protein NUMERIC,
+                fat NUMERIC,
+                carbs NUMERIC,
+                amount NUMERIC DEFAULT 1,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS idx_food_log_user ON food_log(user_id);
         """)
-
-
-# ════════════════════════════════════════════════════════════════
-# AUTH HELPER — извлекаем user_id из заголовка (присылает фронт)
-# ════════════════════════════════════════════════════════════════
-def get_user_id(x_user_id: str = Header(...)) -> int:
-    try:
-        return int(x_user_id)
-    except ValueError:
-        raise HTTPException(400, "Invalid user id")
-
-
-# ════════════════════════════════════════════════════════════════
-# MODELS
-# ════════════════════════════════════════════════════════════════
-class WorkoutIn(BaseModel):
-    date: date
-    muscle: str
-    exercise: str
-    sets: int
-    reps: int
-    weight: float
-
-
-class TaskIn(BaseModel):
-    id: str
-    text: str
-    prio: str
-    dl: Optional[date] = None
-    cat: Optional[str] = None
-    done: bool = False
-
-
-class SupplementIn(BaseModel):
-    name: str
-    emoji: str = "💊"
-    dose: str = ""
-    times: list[str]
-
-
-class SuppCheckIn(BaseModel):
-    date: date
-    supp_name: str
-    time_slot: str
-    checked: bool = True
-
-
-class BodyWeightIn(BaseModel):
-    date: date
-    weight: float
-
-
-class BodyCalIn(BaseModel):
-    date: date
-    calories: int
-
-
-class BulkImportIn(BaseModel):
-    workouts: list[WorkoutIn] = []
 
 
 # ════════════════════════════════════════════════════════════════
@@ -179,24 +134,36 @@ class BulkImportIn(BaseModel):
 async def get_workouts(user_id: int = Header(..., alias="X-User-Id")):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1 ORDER BY date",
+            "SELECT id, date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC",
             user_id
         )
         return [dict(r) for r in rows]
 
 
 @app.post("/api/workouts")
-async def add_workout(w: WorkoutIn, user_id: int = Header(..., alias="X-User-Id")):
+async def add_workout(w: "WorkoutIn", user_id: int = Header(..., alias="X-User-Id")):
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO workouts (user_id, date, muscle, exercise, sets, reps, weight) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        row = await conn.fetchrow(
+            "INSERT INTO workouts (user_id, date, muscle, exercise, sets, reps, weight) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
             user_id, w.date, w.muscle, w.exercise, w.sets, w.reps, w.weight
         )
+    return {"status": "ok", "id": row["id"]}
+
+
+@app.delete("/api/workouts/{workout_id}")
+async def delete_workout(workout_id: int, user_id: int = Header(..., alias="X-User-Id")):
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM workouts WHERE id=$1 AND user_id=$2",
+            workout_id, user_id
+        )
+    if result == "DELETE 0":
+        raise HTTPException(404, "Workout not found")
     return {"status": "ok"}
 
 
 @app.post("/api/workouts/bulk")
-async def bulk_import_workouts(payload: BulkImportIn, user_id: int = Header(..., alias="X-User-Id")):
+async def bulk_import_workouts(payload: "BulkImportIn", user_id: int = Header(..., alias="X-User-Id")):
     async with pool.acquire() as conn:
         async with conn.transaction():
             for w in payload.workouts:
@@ -221,7 +188,7 @@ async def get_tasks(user_id: int = Header(..., alias="X-User-Id")):
 
 
 @app.post("/api/tasks")
-async def upsert_task(t: TaskIn, user_id: int = Header(..., alias="X-User-Id")):
+async def upsert_task(t: "TaskIn", user_id: int = Header(..., alias="X-User-Id")):
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO tasks (id, user_id, text, prio, dl, cat, done)
@@ -252,7 +219,7 @@ async def get_supplements(user_id: int = Header(..., alias="X-User-Id")):
 
 
 @app.post("/api/supplements")
-async def add_supplement(s: SupplementIn, user_id: int = Header(..., alias="X-User-Id")):
+async def add_supplement(s: "SupplementIn", user_id: int = Header(..., alias="X-User-Id")):
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "INSERT INTO supplements (user_id, name, emoji, dose, times) VALUES ($1,$2,$3,$4,$5) RETURNING id",
@@ -279,7 +246,7 @@ async def get_supp_checks(user_id: int = Header(..., alias="X-User-Id")):
 
 
 @app.post("/api/supplement_checks")
-async def toggle_supp_check(c: SuppCheckIn, user_id: int = Header(..., alias="X-User-Id")):
+async def toggle_supp_check(c: "SuppCheckIn", user_id: int = Header(..., alias="X-User-Id")):
     async with pool.acquire() as conn:
         if c.checked:
             await conn.execute("""
@@ -308,7 +275,7 @@ async def get_body_weight(user_id: int = Header(..., alias="X-User-Id")):
 
 
 @app.post("/api/body/weight")
-async def upsert_body_weight(b: BodyWeightIn, user_id: int = Header(..., alias="X-User-Id")):
+async def upsert_body_weight(b: "BodyWeightIn", user_id: int = Header(..., alias="X-User-Id")):
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO body_weight (user_id, date, weight) VALUES ($1,$2,$3)
@@ -327,7 +294,7 @@ async def get_body_calories(user_id: int = Header(..., alias="X-User-Id")):
 
 
 @app.post("/api/body/calories")
-async def upsert_body_calories(b: BodyCalIn, user_id: int = Header(..., alias="X-User-Id")):
+async def upsert_body_calories(b: "BodyCalIn", user_id: int = Header(..., alias="X-User-Id")):
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO body_calories (user_id, date, calories) VALUES ($1,$2,$3)
@@ -337,7 +304,222 @@ async def upsert_body_calories(b: BodyCalIn, user_id: int = Header(..., alias="X
 
 
 # ════════════════════════════════════════════════════════════════
-# FULL EXPORT — для бэкапа
+# FATSECRET — поиск и лог питания
+# ════════════════════════════════════════════════════════════════
+async def get_fatsecret_token() -> str:
+    """Получаем OAuth2 токен FatSecret (client_credentials). Кешируем."""
+    import time
+    now = time.time()
+    if fs_token_cache.get("token") and fs_token_cache.get("expires_at", 0) > now + 60:
+        return fs_token_cache["token"]
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://oauth.fatsecret.com/connect/token",
+            data={
+                "grant_type": "client_credentials",
+                "scope": "basic",
+            },
+            auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        fs_token_cache["token"] = data["access_token"]
+        fs_token_cache["expires_at"] = now + data.get("expires_in", 86400)
+        return fs_token_cache["token"]
+
+
+@app.get("/api/food/search")
+async def search_food(q: str, user_id: int = Header(..., alias="X-User-Id")):
+    """Поиск еды через FatSecret API."""
+    if not FATSECRET_CLIENT_ID:
+        raise HTTPException(503, "FatSecret not configured")
+    try:
+        token = await get_fatsecret_token()
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://platform.fatsecret.com/rest/server.api",
+                params={
+                    "method": "foods.search",
+                    "search_expression": q,
+                    "format": "json",
+                    "max_results": 10,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        foods = data.get("foods", {}).get("food", [])
+        if isinstance(foods, dict):
+            foods = [foods]
+
+        results = []
+        for f in foods:
+            desc = f.get("food_description", "")
+            # Парсим "Per 100g - Calories: 89kcal | Fat: 0.33g | Carbs: 23g | Protein: 1.09g"
+            nutrition = {}
+            for part in desc.split("|"):
+                part = part.strip()
+                if "Calories:" in part:
+                    nutrition["calories"] = float(part.split("Calories:")[-1].replace("kcal", "").strip())
+                elif "Fat:" in part:
+                    nutrition["fat"] = float(part.split("Fat:")[-1].replace("g", "").strip())
+                elif "Carbs:" in part:
+                    nutrition["carbs"] = float(part.split("Carbs:")[-1].replace("g", "").strip())
+                elif "Protein:" in part:
+                    nutrition["protein"] = float(part.split("Protein:")[-1].replace("g", "").strip())
+
+            results.append({
+                "food_id": f.get("food_id"),
+                "food_name": f.get("food_name"),
+                "food_type": f.get("food_type"),
+                "serving_desc": desc,
+                **nutrition,
+            })
+
+        return {"results": results}
+    except Exception as e:
+        raise HTTPException(500, f"FatSecret error: {str(e)}")
+
+
+@app.get("/api/food/log")
+async def get_food_log(log_date: Optional[str] = None, user_id: int = Header(..., alias="X-User-Id")):
+    """Получить лог питания за день."""
+    async with pool.acquire() as conn:
+        if log_date:
+            rows = await conn.fetch(
+                "SELECT * FROM food_log WHERE user_id=$1 AND date=$2 ORDER BY created_at",
+                user_id, date.fromisoformat(log_date)
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM food_log WHERE user_id=$1 ORDER BY date DESC, created_at DESC LIMIT 100",
+                user_id
+            )
+        return [dict(r) for r in rows]
+
+
+@app.post("/api/food/log")
+async def add_food_log(entry: "FoodLogIn", user_id: int = Header(..., alias="X-User-Id")):
+    """Добавить еду в дневник."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO food_log (user_id, date, meal_type, food_id, food_name, serving_desc,
+                                  calories, protein, fat, carbs, amount)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id
+        """, user_id, entry.date, entry.meal_type, entry.food_id, entry.food_name,
+            entry.serving_desc, entry.calories, entry.protein, entry.fat, entry.carbs, entry.amount)
+    return {"status": "ok", "id": row["id"]}
+
+
+@app.delete("/api/food/log/{entry_id}")
+async def delete_food_log(entry_id: int, user_id: int = Header(..., alias="X-User-Id")):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM food_log WHERE id=$1 AND user_id=$2", entry_id, user_id)
+    return {"status": "ok"}
+
+
+# ════════════════════════════════════════════════════════════════
+# ИИ АНАЛИЗ — прогресс и плато через Claude
+# ════════════════════════════════════════════════════════════════
+@app.get("/api/ai/analysis")
+async def ai_analysis(user_id: int = Header(..., alias="X-User-Id")):
+    """Анализ прогресса, плато и рекомендации через Claude API."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "AI not configured")
+
+    async with pool.acquire() as conn:
+        workouts = await conn.fetch(
+            """SELECT date, exercise, sets, reps, weight,
+               ROUND(weight * (1 + reps::numeric/30), 1) as orm
+               FROM workouts WHERE user_id=$1 ORDER BY date""",
+            user_id
+        )
+        body_weight = await conn.fetch(
+            "SELECT date, weight FROM body_weight WHERE user_id=$1 ORDER BY date DESC LIMIT 30",
+            user_id
+        )
+
+    # Группируем по упражнениям для анализа плато
+    exercises_data = {}
+    for r in workouts:
+        ex = r["exercise"]
+        if ex not in exercises_data:
+            exercises_data[ex] = []
+        exercises_data[ex].append({
+            "date": str(r["date"]),
+            "sets": r["sets"],
+            "reps": r["reps"],
+            "weight": float(r["weight"]),
+            "1rm": float(r["orm"])
+        })
+
+    # Берём только ключевые упражнения с достаточной историей
+    key_exercises = {k: v for k, v in exercises_data.items() if len(v) >= 3}
+
+    prompt = f"""Ты персональный тренер и аналитик. Проанализируй данные тренировок пользователя.
+
+ИСТОРИЯ ТРЕНИРОВОК (по упражнениям, отсортировано по дате):
+{json.dumps(key_exercises, ensure_ascii=False, indent=2)}
+
+ДИНАМИКА ВЕСА ТЕЛА (последние 30 записей):
+{json.dumps([dict(r) for r in body_weight], ensure_ascii=False, default=str)}
+
+Дай анализ на русском языке в формате JSON:
+{{
+  "summary": "краткое резюме прогресса за весь период (2-3 предложения)",
+  "top_achievements": ["достижение 1", "достижение 2", "достижение 3"],
+  "plateau": [
+    {{
+      "exercise": "название",
+      "last_weight": 0,
+      "sessions_stuck": 0,
+      "recommendation": "конкретная рекомендация"
+    }}
+  ],
+  "progress": [
+    {{
+      "exercise": "название",
+      "start_1rm": 0,
+      "current_1rm": 0,
+      "growth_percent": 0
+    }}
+  ],
+  "weekly_recommendation": "что делать на следующей неделе",
+  "recovery_note": "заметка о восстановлении если есть паттерны"
+}}
+
+Плато — если за последние 3+ сессии 1RM не вырос более чем на 2.5%.
+Отвечай ТОЛЬКО валидным JSON без комментариев."""
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 1500,
+                    "messages": [{"role": "user", "content": prompt}]
+                }
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            text = result["content"][0]["text"]
+            return json.loads(text)
+    except json.JSONDecodeError:
+        raise HTTPException(500, "AI returned invalid JSON")
+    except Exception as e:
+        raise HTTPException(500, f"AI error: {str(e)}")
+
+
+# ════════════════════════════════════════════════════════════════
+# EXPORT
 # ════════════════════════════════════════════════════════════════
 @app.get("/api/export")
 async def export_all(user_id: int = Header(..., alias="X-User-Id")):
@@ -348,6 +530,7 @@ async def export_all(user_id: int = Header(..., alias="X-User-Id")):
         checks = await conn.fetch("SELECT date, supp_name, time_slot, checked FROM supplement_checks WHERE user_id=$1", user_id)
         weight = await conn.fetch("SELECT date, weight FROM body_weight WHERE user_id=$1", user_id)
         cal = await conn.fetch("SELECT date, calories FROM body_calories WHERE user_id=$1", user_id)
+        food = await conn.fetch("SELECT date, meal_type, food_name, calories, protein, fat, carbs, amount FROM food_log WHERE user_id=$1", user_id)
 
     return {
         "exported_at": str(date.today()),
@@ -358,9 +541,65 @@ async def export_all(user_id: int = Header(..., alias="X-User-Id")):
         "supplement_checks": [dict(r) for r in checks],
         "body_weight": [dict(r) for r in weight],
         "body_calories": [dict(r) for r in cal],
+        "food_log": [dict(r) for r in food],
     }
 
 
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "planner-api"}
+
+
+# ════════════════════════════════════════════════════════════════
+# MODELS (внизу чтобы не мешали роутам)
+# ════════════════════════════════════════════════════════════════
+class WorkoutIn(BaseModel):
+    date: date
+    muscle: str
+    exercise: str
+    sets: int
+    reps: int
+    weight: float
+
+class TaskIn(BaseModel):
+    id: str
+    text: str
+    prio: str
+    dl: Optional[date] = None
+    cat: Optional[str] = None
+    done: bool = False
+
+class SupplementIn(BaseModel):
+    name: str
+    emoji: str = "💊"
+    dose: str = ""
+    times: list[str]
+
+class SuppCheckIn(BaseModel):
+    date: date
+    supp_name: str
+    time_slot: str
+    checked: bool = True
+
+class BodyWeightIn(BaseModel):
+    date: date
+    weight: float
+
+class BodyCalIn(BaseModel):
+    date: date
+    calories: int
+
+class FoodLogIn(BaseModel):
+    date: date
+    meal_type: str
+    food_id: str
+    food_name: str
+    serving_desc: Optional[str] = None
+    calories: Optional[float] = None
+    protein: Optional[float] = None
+    fat: Optional[float] = None
+    carbs: Optional[float] = None
+    amount: float = 1.0
+
+class BulkImportIn(BaseModel):
+    workouts: list[WorkoutIn] = []
