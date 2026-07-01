@@ -21,6 +21,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 pool: Optional[asyncpg.Pool] = None
 fs_token_cache: dict = {}  # {"token": "...", "expires_at": timestamp}
+import logging
 
 
 # ════════════════════════════════════════════════════════════════
@@ -373,10 +374,11 @@ async def get_fatsecret_token() -> str:
             "https://oauth.fatsecret.com/connect/token",
             data={
                 "grant_type": "client_credentials",
-                "scope": "basic",
             },
             auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
+        logging.warning(f"FatSecret token response: {resp.status_code} {resp.text[:200]}")
         resp.raise_for_status()
         data = resp.json()
         fs_token_cache["token"] = data["access_token"]
@@ -404,8 +406,11 @@ async def search_food(q: str, user_id: int = Header(..., alias="X-User-Id")):
             )
             resp.raise_for_status()
             data = resp.json()
-            import logging
-            logging.warning(f"FatSecret response keys: {list(data.keys())}, foods: {str(data.get('foods','NO_FOODS'))[:200]}")
+            logging.warning(f"FatSecret full response: {str(data)[:500]}")
+
+        # Проверяем на ошибку
+        if "error" in data:
+            raise HTTPException(400, f"FatSecret error: {data['error']}")
 
         # Обрабатываем разные форматы ответа
         foods_data = data.get("foods", {})
