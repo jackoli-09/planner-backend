@@ -391,7 +391,7 @@ async def search_food(q: str, user_id: int = Header(..., alias="X-User-Id")):
         raise HTTPException(503, "FatSecret not configured")
     try:
         token = await get_fatsecret_token()
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 "https://platform.fatsecret.com/rest/server.api",
                 params={
@@ -399,43 +399,123 @@ async def search_food(q: str, user_id: int = Header(..., alias="X-User-Id")):
                     "search_expression": q,
                     "format": "json",
                     "max_results": 10,
+                    "language": "ru",
+                    "region": "RU",
                 },
                 headers={"Authorization": f"Bearer {token}"},
             )
             resp.raise_for_status()
             data = resp.json()
 
-        foods = data.get("foods", {}).get("food", [])
+        # Обрабатываем разные форматы ответа
+        foods_data = data.get("foods", {})
+        if not foods_data:
+            return {"results": []}
+        
+        foods = foods_data.get("food", [])
         if isinstance(foods, dict):
             foods = [foods]
+        if not foods:
+            return {"results": []}
 
         results = []
-        for f in foods:
-            desc = f.get("food_description", "")
+        for item in foods:
+            desc = item.get("food_description", "")
+            nutrition = {"calories": 0, "fat": 0, "carbs": 0, "protein": 0}
+            
             # Парсим "Per 100g - Calories: 89kcal | Fat: 0.33g | Carbs: 23g | Protein: 1.09g"
-            nutrition = {}
-            for part in desc.split("|"):
-                part = part.strip()
-                if "Calories:" in part:
-                    nutrition["calories"] = float(part.split("Calories:")[-1].replace("kcal", "").strip())
-                elif "Fat:" in part:
-                    nutrition["fat"] = float(part.split("Fat:")[-1].replace("g", "").strip())
-                elif "Carbs:" in part:
-                    nutrition["carbs"] = float(part.split("Carbs:")[-1].replace("g", "").strip())
-                elif "Protein:" in part:
-                    nutrition["protein"] = float(part.split("Protein:")[-1].replace("g", "").strip())
+            try:
+                for part in desc.split("|"):
+                    part = part.strip()
+                    if "Calories:" in part:
+                        val = part.split("Calories:")[-1].replace("kcal", "").strip()
+                        nutrition["calories"] = round(float(val), 1)
+                    elif "Fat:" in part:
+                        val = part.split("Fat:")[-1].replace("g", "").strip()
+                        nutrition["fat"] = round(float(val), 1)
+                    elif "Carbs:" in part:
+                        val = part.split("Carbs:")[-1].replace("g", "").strip()
+                        nutrition["carbs"] = round(float(val), 1)
+                    elif "Protein:" in part:
+                        val = part.split("Protein:")[-1].replace("g", "").strip()
+                        nutrition["protein"] = round(float(val), 1)
+            except (ValueError, IndexError):
+                pass
 
             results.append({
-                "food_id": f.get("food_id"),
-                "food_name": f.get("food_name"),
-                "food_type": f.get("food_type"),
+                "food_id": str(item.get("food_id", "")),
+                "food_name": item.get("food_name", ""),
+                "food_type": item.get("food_type", ""),
+                "brand_name": item.get("brand_name", ""),
                 "serving_desc": desc,
                 **nutrition,
             })
 
         return {"results": results}
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(e.response.status_code, f"FatSecret API error: {e.response.text}")
     except Exception as e:
         raise HTTPException(500, f"FatSecret error: {str(e)}")
+
+
+@app.get("/api/food/barcode")
+async def search_by_barcode(barcode: str, user_id: int = Header(..., alias="X-User-Id")):
+    """Поиск еды по штрихкоду через FatSecret API."""
+    if not FATSECRET_CLIENT_ID:
+        raise HTTPException(503, "FatSecret not configured")
+    try:
+        token = await get_fatsecret_token()
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://platform.fatsecret.com/rest/server.api",
+                params={
+                    "method": "food.find_id_for_barcode",
+                    "barcode": barcode,
+                    "format": "json",
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        
+        food_id = data.get("food_id", {}).get("value")
+        if not food_id:
+            return {"results": []}
+        
+        # Получаем детали продукта
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp2 = await client.get(
+                "https://platform.fatsecret.com/rest/server.api",
+                params={
+                    "method": "food.get.v4",
+                    "food_id": food_id,
+                    "format": "json",
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            resp2.raise_for_status()
+            food_data = resp2.json()
+        
+        food = food_data.get("food", {})
+        servings = food.get("servings", {}).get("serving", [])
+        if isinstance(servings, dict):
+            servings = [servings]
+        
+        # Берём первый вариант порции (обычно 100г)
+        s = servings[0] if servings else {}
+        
+        return {"results": [{
+            "food_id": str(food_id),
+            "food_name": food.get("food_name", ""),
+            "brand_name": food.get("brand_name", ""),
+            "serving_desc": s.get("serving_description", "100г"),
+            "calories": round(float(s.get("calories", 0)), 1),
+            "protein": round(float(s.get("protein", 0)), 1),
+            "fat": round(float(s.get("fat", 0)), 1),
+            "carbs": round(float(s.get("carbohydrate", 0)), 1),
+        }]}
+    except Exception as e:
+        raise HTTPException(500, f"Barcode error: {str(e)}")
 
 
 @app.get("/api/food/log")
