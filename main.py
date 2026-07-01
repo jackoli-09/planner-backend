@@ -23,6 +23,61 @@ pool: Optional[asyncpg.Pool] = None
 fs_token_cache: dict = {}  # {"token": "...", "expires_at": timestamp}
 
 
+# ════════════════════════════════════════════════════════════════
+# MODELS
+# ════════════════════════════════════════════════════════════════
+class WorkoutIn(BaseModel):
+    date: date
+    muscle: str
+    exercise: str
+    sets: int
+    reps: int
+    weight: float
+
+class TaskIn(BaseModel):
+    id: str
+    text: str
+    prio: str
+    dl: Optional[date] = None
+    cat: Optional[str] = None
+    done: bool = False
+
+class SupplementIn(BaseModel):
+    name: str
+    emoji: str = "💊"
+    dose: str = ""
+    times: list[str]
+
+class SuppCheckIn(BaseModel):
+    date: date
+    supp_name: str
+    time_slot: str
+    checked: bool = True
+
+class BodyWeightIn(BaseModel):
+    date: date
+    weight: float
+
+class BodyCalIn(BaseModel):
+    date: date
+    calories: int
+
+class FoodLogIn(BaseModel):
+    date: date
+    meal_type: str
+    food_id: str
+    food_name: str
+    serving_desc: Optional[str] = None
+    calories: Optional[float] = None
+    protein: Optional[float] = None
+    fat: Optional[float] = None
+    carbs: Optional[float] = None
+    amount: float = 1.0
+
+class BulkImportIn(BaseModel):
+    workouts: list[WorkoutIn] = []
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool
@@ -559,58 +614,3 @@ async def export_all(user_id: int = Header(..., alias="X-User-Id")):
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "planner-api"}
-
-
-# ════════════════════════════════════════════════════════════════
-# MODELS (внизу чтобы не мешали роутам)
-# ════════════════════════════════════════════════════════════════
-class WorkoutIn(BaseModel):
-    date: date
-    muscle: str
-    exercise: str
-    sets: int
-    reps: int
-    weight: float
-
-class TaskIn(BaseModel):
-    id: str
-    text: str
-    prio: str
-    dl: Optional[date] = None
-    cat: Optional[str] = None
-    done: bool = False
-
-class SupplementIn(BaseModel):
-    name: str
-    emoji: str = "💊"
-    dose: str = ""
-    times: list[str]
-
-class SuppCheckIn(BaseModel):
-    date: date
-    supp_name: str
-    time_slot: str
-    checked: bool = True
-
-class BodyWeightIn(BaseModel):
-    date: date
-    weight: float
-
-class BodyCalIn(BaseModel):
-    date: date
-    calories: int
-
-class FoodLogIn(BaseModel):
-    date: date
-    meal_type: str
-    food_id: str
-    food_name: str
-    serving_desc: Optional[str] = None
-    calories: Optional[float] = None
-    protein: Optional[float] = None
-    fat: Optional[float] = None
-    carbs: Optional[float] = None
-    amount: float = 1.0
-
-class BulkImportIn(BaseModel):
-    workouts: list[WorkoutIn] = []
