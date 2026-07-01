@@ -382,44 +382,48 @@ def parse_off_product(p: dict) -> dict:
 
 @app.get("/api/food/search")
 async def search_food(q: str, user_id: int = Header(..., alias="X-User-Id")):
-    """Поиск еды через Open Food Facts API."""
+    """Поиск еды через Open Food Facts API v2."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            # Пробуем новый API v2
             resp = await client.get(
-                "https://world.openfoodfacts.org/cgi/search.pl",
+                "https://world.openfoodfacts.org/api/v2/search",
                 params={
                     "search_terms": q,
-                    "search_simple": 1,
-                    "action": "process",
-                    "json": 1,
                     "page_size": 15,
                     "fields": "id,product_name,product_name_ru,product_name_en,brands,nutriments",
                     "sort_by": "unique_scans_n",
                 },
-                headers={"User-Agent": "PlannerApp/1.0"}
+                headers={"User-Agent": "PlannerApp/1.0 (contact@example.com)"}
             )
+            logging.warning(f"OFF search status: {resp.status_code}, url: {resp.url}")
             resp.raise_for_status()
             data = resp.json()
 
         products = data.get("products", [])
+        logging.warning(f"OFF products count: {len(products)}")
+        
         results = []
         for p in products:
             item = parse_off_product(p)
-            # Пропускаем продукты без названия или калорий
             if not item["food_name"] or item["food_name"] == "Неизвестный продукт":
                 continue
             results.append(item)
 
         return {"results": results[:10]}
+    except httpx.ConnectError as e:
+        logging.error(f"Connect error: {e}")
+        raise HTTPException(503, f"Cannot connect to food database: {str(e)}")
     except Exception as e:
-        raise HTTPException(500, f"Search error: {str(e)}")
+        logging.error(f"Search error: {type(e).__name__}: {e}")
+        raise HTTPException(500, f"Search error: {type(e).__name__}: {str(e)}")
 
 
 @app.get("/api/food/barcode")
 async def search_by_barcode(barcode: str, user_id: int = Header(..., alias="X-User-Id")):
     """Поиск еды по штрихкоду через Open Food Facts."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(
                 f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json",
                 headers={"User-Agent": "PlannerApp/1.0"}
@@ -434,7 +438,8 @@ async def search_by_barcode(barcode: str, user_id: int = Header(..., alias="X-Us
         item = parse_off_product(product)
         return {"results": [item]}
     except Exception as e:
-        raise HTTPException(500, f"Barcode error: {str(e)}")
+        logging.error(f"Barcode error: {type(e).__name__}: {e}")
+        raise HTTPException(500, f"Barcode error: {type(e).__name__}: {str(e)}")
 
 
 @app.get("/api/food/log")
