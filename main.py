@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 FATSECRET_CLIENT_ID = os.environ.get("FATSECRET_CLIENT_ID", "")
 FATSECRET_CLIENT_SECRET = os.environ.get("FATSECRET_CLIENT_SECRET", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 pool: Optional[asyncpg.Pool] = None
 fs_token_cache: dict = {}  # {"token": "...", "expires_at": timestamp}
@@ -425,8 +425,8 @@ async def delete_food_log(entry_id: int, user_id: int = Header(..., alias="X-Use
 # ════════════════════════════════════════════════════════════════
 @app.get("/api/ai/analysis")
 async def ai_analysis(user_id: int = Header(..., alias="X-User-Id")):
-    """Анализ прогресса, плато и рекомендации через Claude API."""
-    if not ANTHROPIC_API_KEY:
+    """Анализ прогресса, плато и рекомендации через Groq (Llama 3.3 70B)."""
+    if not GROQ_API_KEY:
         raise HTTPException(503, "AI not configured")
 
     async with pool.acquire() as conn:
@@ -441,7 +441,7 @@ async def ai_analysis(user_id: int = Header(..., alias="X-User-Id")):
             user_id
         )
 
-    # Группируем по упражнениям для анализа плато
+    # Группируем по упражнениям
     exercises_data = {}
     for r in workouts:
         ex = r["exercise"]
@@ -455,7 +455,7 @@ async def ai_analysis(user_id: int = Header(..., alias="X-User-Id")):
             "1rm": float(r["orm"])
         })
 
-    # Берём только ключевые упражнения с достаточной историей
+    # Только упражнения с 3+ сессиями
     key_exercises = {k: v for k, v in exercises_data.items() if len(v) >= 3}
 
     prompt = f"""Ты персональный тренер и аналитик. Проанализируй данные тренировок пользователя.
@@ -491,29 +491,40 @@ async def ai_analysis(user_id: int = Header(..., alias="X-User-Id")):
 }}
 
 Плато — если за последние 3+ сессии 1RM не вырос более чем на 2.5%.
-Отвечай ТОЛЬКО валидным JSON без комментариев."""
+Отвечай ТОЛЬКО валидным JSON без markdown, без комментариев, без ```json."""
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                "https://api.groq.com/openai/v1/chat/completions",
                 headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-6",
+                    "model": "llama-3.3-70b-versatile",
                     "max_tokens": 1500,
-                    "messages": [{"role": "user", "content": prompt}]
+                    "temperature": 0.3,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Ты спортивный аналитик. Отвечай только валидным JSON без markdown."
+                        },
+                        {"role": "user", "content": prompt}
+                    ]
                 }
             )
             resp.raise_for_status()
             result = resp.json()
-            text = result["content"][0]["text"]
+            text = result["choices"][0]["message"]["content"].strip()
+            # Убираем markdown если модель всё же добавила
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
             return json.loads(text)
-    except json.JSONDecodeError:
-        raise HTTPException(500, "AI returned invalid JSON")
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"AI returned invalid JSON: {str(e)}")
     except Exception as e:
         raise HTTPException(500, f"AI error: {str(e)}")
 
