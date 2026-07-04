@@ -5,8 +5,10 @@ FastAPI backend для Telegram Mini App "Мой планировщик"
 import os
 import json
 import httpx
-from datetime import date
+import asyncio
+from datetime import date, datetime, time
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Header
@@ -16,6 +18,8 @@ from contextlib import asynccontextmanager
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+TZ = ZoneInfo("Europe/Moscow")
 
 pool: Optional[asyncpg.Pool] = None
 import logging
@@ -81,7 +85,10 @@ async def lifespan(app: FastAPI):
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     await init_db()
+    # Запускаем планировщик уведомлений
+    task = asyncio.create_task(notification_scheduler())
     yield
+    task.cancel()
     await pool.close()
 
 
@@ -177,7 +184,137 @@ async def init_db():
                 created_at TIMESTAMPTZ DEFAULT now()
             );
             CREATE INDEX IF NOT EXISTS idx_food_log_user ON food_log(user_id);
+
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id BIGINT PRIMARY KEY,
+                notif_morning TEXT DEFAULT '08:00',
+                notif_morning_on BOOLEAN DEFAULT TRUE,
+                notif_workout TEXT DEFAULT '10:00',
+                notif_workout_on BOOLEAN DEFAULT TRUE,
+                notif_evening TEXT DEFAULT '21:00',
+                notif_evening_on BOOLEAN DEFAULT TRUE,
+                notif_weekly_on BOOLEAN DEFAULT TRUE,
+                timezone TEXT DEFAULT 'Europe/Moscow',
+                updated_at TIMESTAMPTZ DEFAULT now()
+            );
         """)
+
+
+
+# ════════════════════════════════════════════════════════════════
+# УВЕДОМЛЕНИЯ — Telegram Bot
+# ════════════════════════════════════════════════════════════════
+async def send_telegram(user_id: int, text: str):
+    """Отправляем сообщение пользователю через Telegram Bot API."""
+    if not BOT_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": user_id, "text": text, "parse_mode": "HTML"}
+            )
+    except Exception as e:
+        logging.warning(f"Telegram send error: {e}")
+
+
+async def notification_scheduler():
+    """Планировщик — каждую минуту проверяет нужно ли слать уведомления."""
+    logging.info("Notification scheduler started")
+    while True:
+        try:
+            await asyncio.sleep(60)  # проверяем каждую минуту
+            now = datetime.now(TZ)
+            current_time = now.strftime("%H:%M")
+            current_weekday = now.weekday()  # 0=Пн, 6=Вс
+            
+            async with pool.acquire() as conn:
+                users = await conn.fetch("SELECT * FROM user_settings")
+            
+            for u in users:
+                uid = u["user_id"]
+                
+                # Утренние добавки
+                if u["notif_morning_on"] and u["notif_morning"] == current_time:
+                    async with pool.acquire() as conn:
+                        supps = await conn.fetch(
+                            "SELECT name FROM supplements WHERE user_id=$1 AND times::text LIKE '%утро%'", uid
+                        )
+                    if supps:
+                        names = ", ".join(s["name"] for s in supps[:3])
+                        await send_telegram(uid, "☀️ <b>Доброе утро!</b>\n\nНе забудь принять добавки: " + names)
+                
+                # Напоминание о тренировке
+                if u["notif_workout_on"] and u["notif_workout"] == current_time:
+                    # Проверяем был ли уже подход сегодня
+                    async with pool.acquire() as conn:
+                        today_workouts = await conn.fetchval(
+                            "SELECT COUNT(*) FROM workouts WHERE user_id=$1 AND date=$2",
+                            uid, date.today()
+                        )
+                    if today_workouts == 0:
+                        days = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+                        splits = {0:"Ноги 🦵",1:"Грудь + Трицепс 💪",3:"Спина + Бицепс 🏋️",4:"Плечи 🎯"}
+                        workout_today = splits.get(current_weekday, "Тренировка")
+                        await send_telegram(uid, "💪 <b>Сегодня " + days[current_weekday] + "</b>\n\n" + workout_today + " — не пропусти!")
+                
+                # Вечерние добавки
+                if u["notif_evening_on"] and u["notif_evening"] == current_time:
+                    async with pool.acquire() as conn:
+                        supps = await conn.fetch(
+                            "SELECT name FROM supplements WHERE user_id=$1 AND times::text LIKE '%вечер%'", uid
+                        )
+                    if supps:
+                        names = ", ".join(s["name"] for s in supps[:3])
+                        await send_telegram(uid, "🌙 <b>Вечерние добавки</b>\n\nПора принять: " + names + "\n\nХорошего сна!")
+                
+                # Еженедельный отчёт — воскресенье 19:00
+                if u["notif_weekly_on"] and current_weekday == 6 and current_time == "19:00":
+                    await send_weekly_report(uid)
+        
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.error(f"Scheduler error: {e}")
+
+
+async def send_weekly_report(user_id: int):
+    """Отправляем еженедельный отчёт."""
+    try:
+        from datetime import timedelta
+        week_ago = date.today() - timedelta(days=7)
+        
+        async with pool.acquire() as conn:
+            workouts = await conn.fetchval(
+                "SELECT COUNT(DISTINCT date) FROM workouts WHERE user_id=$1 AND date >= $2",
+                user_id, week_ago
+            )
+            best = await conn.fetch("""
+                SELECT exercise, MAX(ROUND(weight*(1+reps::numeric/30),1)) as orm
+                FROM workouts WHERE user_id=$1 AND date >= $2
+                GROUP BY exercise ORDER BY orm DESC LIMIT 3
+            """, user_id, week_ago)
+            food = await conn.fetch(
+                "SELECT date, SUM(calories) as cal FROM food_log WHERE user_id=$1 AND date >= $2 GROUP BY date",
+                user_id, week_ago
+            )
+        
+        text = "Отчет за неделю\n\n"
+        text += "Тренировок: " + str(workouts) + " из 7 дней\n"
+        
+        if best:
+            text += "\nЛучшие результаты:\n"
+            for b in best:
+                text += "  - " + str(b["exercise"]) + ": " + str(b["orm"]) + " кг 1RM\n"
+        
+        if food:
+            avg_cal = sum(float(f["cal"]) for f in food) / len(food)
+            text += "\nСреднее калорий/день: " + str(round(avg_cal)) + " ккал\n"
+        
+        text += "\nОткрой планировщик чтобы увидеть полный отчёт!"
+        await send_telegram(user_id, text)
+    except Exception as e:
+        logging.error("Weekly report error: " + str(e))
 
 
 # ════════════════════════════════════════════════════════════════
