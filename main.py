@@ -200,6 +200,13 @@ async def init_db():
         """)
 
 
+async def ensure_user_settings(user_id: int):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_settings (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            user_id
+        )
+
 
 # ════════════════════════════════════════════════════════════════
 # УВЕДОМЛЕНИЯ — Telegram Bot
@@ -238,7 +245,7 @@ async def notification_scheduler():
                 if u["notif_morning_on"] and u["notif_morning"] == current_time:
                     async with pool.acquire() as conn:
                         supps = await conn.fetch(
-                            "SELECT name FROM supplements WHERE user_id=$1 AND times::text LIKE '%утро%'", uid
+                            "SELECT name FROM supplements WHERE user_id=$1 AND times::text ILIKE '%утро%'", uid
                         )
                     if supps:
                         names = ", ".join(s["name"] for s in supps[:3])
@@ -250,7 +257,7 @@ async def notification_scheduler():
                     async with pool.acquire() as conn:
                         today_workouts = await conn.fetchval(
                             "SELECT COUNT(*) FROM workouts WHERE user_id=$1 AND date=$2",
-                            uid, date.today()
+                            uid, now.date()
                         )
                     if today_workouts == 0:
                         days = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
@@ -262,7 +269,7 @@ async def notification_scheduler():
                 if u["notif_evening_on"] and u["notif_evening"] == current_time:
                     async with pool.acquire() as conn:
                         supps = await conn.fetch(
-                            "SELECT name FROM supplements WHERE user_id=$1 AND times::text LIKE '%вечер%'", uid
+                            "SELECT name FROM supplements WHERE user_id=$1 AND times::text ILIKE '%вечер%'", uid
                         )
                     if supps:
                         names = ", ".join(s["name"] for s in supps[:3])
@@ -282,7 +289,8 @@ async def send_weekly_report(user_id: int):
     """Отправляем еженедельный отчёт."""
     try:
         from datetime import timedelta
-        week_ago = date.today() - timedelta(days=7)
+        today = datetime.now(TZ).date()
+        week_ago = today - timedelta(days=7)
         
         async with pool.acquire() as conn:
             workouts = await conn.fetchval(
@@ -322,6 +330,7 @@ async def send_weekly_report(user_id: int):
 # ════════════════════════════════════════════════════════════════
 @app.get("/api/workouts")
 async def get_workouts(user_id: int = Header(..., alias="X-User-Id")):
+    await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id, date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC",
