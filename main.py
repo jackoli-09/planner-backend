@@ -483,6 +483,16 @@ async def upsert_body_weight(b: "BodyWeightIn", user_id: int = Header(..., alias
     return {"status": "ok"}
 
 
+@app.delete("/api/body/weight/{entry_date}")
+async def delete_body_weight(entry_date: date, user_id: int = Header(..., alias="X-User-Id")):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM body_weight WHERE user_id=$1 AND date=$2",
+            user_id, entry_date
+        )
+    return {"status": "ok"}
+
+
 @app.get("/api/body/calories")
 async def get_body_calories(user_id: int = Header(..., alias="X-User-Id")):
     async with pool.acquire() as conn:
@@ -499,6 +509,16 @@ async def upsert_body_calories(b: "BodyCalIn", user_id: int = Header(..., alias=
             INSERT INTO body_calories (user_id, date, calories) VALUES ($1,$2,$3)
             ON CONFLICT (user_id, date) DO UPDATE SET calories=$3
         """, user_id, b.date, b.calories)
+    return {"status": "ok"}
+
+
+@app.delete("/api/body/calories/{entry_date}")
+async def delete_body_calories(entry_date: date, user_id: int = Header(..., alias="X-User-Id")):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM body_calories WHERE user_id=$1 AND date=$2",
+            user_id, entry_date
+        )
     return {"status": "ok"}
 
 
