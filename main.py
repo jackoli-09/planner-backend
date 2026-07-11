@@ -6,12 +6,17 @@ import os
 import json
 import httpx
 import asyncio
+import hashlib
+import hmac
+import html
+import time as unix_time
 from datetime import date, datetime, time
 from typing import Optional
+from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -19,6 +24,11 @@ from contextlib import asynccontextmanager
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ALLOW_INSECURE_DEMO = os.environ.get("ALLOW_INSECURE_DEMO", "false").lower() == "true"
+ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get(
+    "ALLOWED_ORIGINS",
+    "https://jackoli-09.github.io,http://127.0.0.1:8134,http://localhost:8134"
+).split(",") if origin.strip()]
 TZ = ZoneInfo("Europe/Moscow")
 
 pool: Optional[asyncpg.Pool] = None
@@ -38,6 +48,7 @@ DEFAULT_SUPPLEMENTS = [
 # MODELS
 # ════════════════════════════════════════════════════════════════
 class WorkoutIn(BaseModel):
+    client_id: Optional[str] = None
     date: date
     muscle: str
     exercise: str
@@ -54,6 +65,7 @@ class TaskIn(BaseModel):
     done: bool = False
 
 class SupplementIn(BaseModel):
+    client_id: Optional[str] = None
     name: str
     emoji: str = "💊"
     dose: str = ""
@@ -73,7 +85,18 @@ class BodyCalIn(BaseModel):
     date: date
     calories: int
 
+class BodyMeasureIn(BaseModel):
+    date: date
+    weight: float
+    height: float
+    chest: Optional[float] = None
+    waist: Optional[float] = None
+    hips: Optional[float] = None
+    fat: Optional[float] = None
+    muscle: Optional[float] = None
+
 class FoodLogIn(BaseModel):
+    client_id: Optional[str] = None
     date: date
     meal_type: str
     food_id: str
@@ -107,11 +130,47 @@ app = FastAPI(title="Planner API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def verify_telegram_init_data(init_data: str, max_age_seconds: int = 86400) -> int:
+    if not BOT_TOKEN:
+        raise HTTPException(503, "Telegram authentication is not configured")
+    try:
+        values = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = values.pop("hash")
+        auth_date = int(values.get("auth_date", "0"))
+        if not auth_date or abs(int(unix_time.time()) - auth_date) > max_age_seconds:
+            raise HTTPException(401, "Telegram authorization has expired")
+        data_check_string = "\n".join(f"{key}={values[key]}" for key in sorted(values))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated_hash, received_hash):
+            raise HTTPException(401, "Invalid Telegram authorization")
+        user = json.loads(values.get("user", "{}"))
+        user_id = int(user.get("id", 0))
+        if user_id <= 0:
+            raise HTTPException(401, "Telegram user is missing")
+        return user_id
+    except HTTPException:
+        raise
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(401, "Invalid Telegram authorization")
+
+
+async def authenticated_user(
+    telegram_init_data: Optional[str] = Header(None, alias="X-Telegram-Init-Data"),
+    demo_user_id: Optional[int] = Header(None, alias="X-User-Id"),
+) -> int:
+    if telegram_init_data:
+        return verify_telegram_init_data(telegram_init_data)
+    if ALLOW_INSECURE_DEMO and demo_user_id and demo_user_id > 0:
+        return demo_user_id
+    raise HTTPException(401, "Open the planner inside Telegram")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -130,6 +189,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS workouts (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
+                client_id TEXT,
                 date DATE NOT NULL,
                 muscle TEXT NOT NULL,
                 exercise TEXT NOT NULL,
@@ -158,6 +218,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS supplements (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
+                client_id TEXT,
                 name TEXT NOT NULL,
                 emoji TEXT,
                 dose TEXT,
@@ -190,9 +251,24 @@ async def init_db():
                 PRIMARY KEY (user_id, date)
             );
 
+            CREATE TABLE IF NOT EXISTS body_measures (
+                user_id BIGINT NOT NULL,
+                date DATE NOT NULL,
+                weight NUMERIC NOT NULL,
+                height NUMERIC NOT NULL,
+                chest NUMERIC,
+                waist NUMERIC,
+                hips NUMERIC,
+                fat NUMERIC,
+                muscle NUMERIC,
+                updated_at TIMESTAMPTZ DEFAULT now(),
+                PRIMARY KEY (user_id, date)
+            );
+
             CREATE TABLE IF NOT EXISTS food_log (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
+                client_id TEXT,
                 date DATE NOT NULL,
                 meal_type TEXT NOT NULL,
                 food_id TEXT NOT NULL,
@@ -221,6 +297,14 @@ async def init_db():
                 seeded_defaults BOOLEAN DEFAULT FALSE,
                 updated_at TIMESTAMPTZ DEFAULT now()
             );
+
+            CREATE TABLE IF NOT EXISTS notification_deliveries (
+                user_id BIGINT NOT NULL,
+                kind TEXT NOT NULL,
+                scheduled_key TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                PRIMARY KEY (user_id, kind, scheduled_key)
+            );
         """)
         await conn.execute("""
             DO $$
@@ -240,6 +324,12 @@ async def init_db():
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS seeded_defaults BOOLEAN DEFAULT FALSE")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'Europe/Moscow'")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()")
+        await conn.execute("ALTER TABLE food_log ADD COLUMN IF NOT EXISTS client_id TEXT")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_food_log_user_client ON food_log(user_id, client_id) WHERE client_id IS NOT NULL")
+        await conn.execute("ALTER TABLE workouts ADD COLUMN IF NOT EXISTS client_id TEXT")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_workouts_user_client ON workouts(user_id, client_id) WHERE client_id IS NOT NULL")
+        await conn.execute("ALTER TABLE supplements ADD COLUMN IF NOT EXISTS client_id TEXT")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_supplements_user_client ON supplements(user_id, client_id) WHERE client_id IS NOT NULL")
 
 
 async def ensure_user_settings(user_id: int):
@@ -281,7 +371,7 @@ async def fetch_user_state(user_id: int) -> dict:
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         workouts = await conn.fetch(
-            "SELECT id, date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC",
+            "SELECT id, client_id, date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC",
             user_id
         )
         tasks = await conn.fetch(
@@ -289,7 +379,7 @@ async def fetch_user_state(user_id: int) -> dict:
             user_id
         )
         supps = await conn.fetch(
-            "SELECT id, name, emoji, dose, times FROM supplements WHERE user_id=$1 ORDER BY id",
+            "SELECT id, client_id, name, emoji, dose, times FROM supplements WHERE user_id=$1 ORDER BY id",
             user_id
         )
         checks = await conn.fetch(
@@ -304,11 +394,29 @@ async def fetch_user_state(user_id: int) -> dict:
             "SELECT date, calories FROM body_calories WHERE user_id=$1 ORDER BY date",
             user_id
         )
+        food_calories = await conn.fetch(
+            """SELECT date, ROUND(SUM(COALESCE(calories, 0)))::int AS calories
+               FROM food_log WHERE user_id=$1 GROUP BY date ORDER BY date""",
+            user_id
+        )
+        measures = await conn.fetch(
+            "SELECT date, weight, height, chest, waist, hips, fat, muscle FROM body_measures WHERE user_id=$1 ORDER BY date",
+            user_id
+        )
         food_recent = await conn.fetch(
             "SELECT * FROM food_log WHERE user_id=$1 ORDER BY date DESC, created_at DESC LIMIT 100",
             user_id
         )
         settings = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id=$1", user_id)
+
+    daily_calories = {
+        row["date"]: {"date": row["date"], "calories": row["calories"], "source": "manual"}
+        for row in calories
+    }
+    for row in food_calories:
+        daily_calories[row["date"]] = {
+            "date": row["date"], "calories": row["calories"], "source": "food"
+        }
 
     return {
         "user_id": user_id,
@@ -318,7 +426,8 @@ async def fetch_user_state(user_id: int) -> dict:
         "supplements": [dict(r) | {"times": parse_times(r["times"])} for r in supps],
         "supplement_checks": [dict(r) for r in checks],
         "body_weight": [dict(r) for r in weight],
-        "body_calories": [dict(r) for r in calories],
+        "body_calories": [daily_calories[key] for key in sorted(daily_calories)],
+        "body_measures": [dict(r) for r in measures],
         "food_log_recent": [dict(r) for r in food_recent],
     }
 
@@ -340,34 +449,51 @@ async def send_telegram(user_id: int, text: str):
         logging.warning(f"Telegram send error: {e}")
 
 
+async def claim_notification(user_id: int, kind: str, scheduled_key: str) -> bool:
+    async with pool.acquire() as conn:
+        claimed = await conn.fetchval("""
+            INSERT INTO notification_deliveries (user_id, kind, scheduled_key)
+            VALUES ($1,$2,$3)
+            ON CONFLICT DO NOTHING
+            RETURNING 1
+        """, user_id, kind, scheduled_key)
+    return bool(claimed)
+
+
 async def notification_scheduler():
     """Планировщик — каждую минуту проверяет нужно ли слать уведомления."""
     logging.info("Notification scheduler started")
     while True:
         try:
             await asyncio.sleep(60)  # проверяем каждую минуту
-            now = datetime.now(TZ)
-            current_time = now.strftime("%H:%M")
-            current_weekday = now.weekday()  # 0=Пн, 6=Вс
-            
             async with pool.acquire() as conn:
                 users = await conn.fetch("SELECT * FROM user_settings")
             
             for u in users:
                 uid = u["user_id"]
+                try:
+                    user_tz = ZoneInfo(u["timezone"] or "Europe/Moscow")
+                except Exception:
+                    user_tz = TZ
+                now = datetime.now(user_tz)
+                current_time = now.strftime("%H:%M")
+                current_weekday = now.weekday()
+                delivery_key = now.strftime("%Y-%m-%dT%H:%M")
                 
                 # Утренние добавки
-                if u["notif_morning_on"] and u["notif_morning"] == current_time:
+                if (u["notif_morning_on"] and u["notif_morning"] == current_time
+                        and await claim_notification(uid, "supplements_morning", delivery_key)):
                     async with pool.acquire() as conn:
                         supps = await conn.fetch(
                             "SELECT name FROM supplements WHERE user_id=$1 AND times::text ILIKE '%утро%'", uid
                         )
                     if supps:
-                        names = ", ".join(s["name"] for s in supps[:3])
+                        names = ", ".join(html.escape(s["name"]) for s in supps[:3])
                         await send_telegram(uid, "☀️ <b>Доброе утро!</b>\n\nНе забудь принять добавки: " + names)
                 
                 # Напоминание о тренировке
-                if u["notif_workout_on"] and u["notif_workout"] == current_time:
+                if (u["notif_workout_on"] and u["notif_workout"] == current_time
+                        and await claim_notification(uid, "workout", delivery_key)):
                     # Проверяем был ли уже подход сегодня
                     async with pool.acquire() as conn:
                         today_workouts = await conn.fetchval(
@@ -381,17 +507,19 @@ async def notification_scheduler():
                         await send_telegram(uid, "💪 <b>Сегодня " + days[current_weekday] + "</b>\n\n" + workout_today + " — не пропусти!")
                 
                 # Вечерние добавки
-                if u["notif_evening_on"] and u["notif_evening"] == current_time:
+                if (u["notif_evening_on"] and u["notif_evening"] == current_time
+                        and await claim_notification(uid, "supplements_evening", delivery_key)):
                     async with pool.acquire() as conn:
                         supps = await conn.fetch(
                             "SELECT name FROM supplements WHERE user_id=$1 AND times::text ILIKE '%вечер%'", uid
                         )
                     if supps:
-                        names = ", ".join(s["name"] for s in supps[:3])
+                        names = ", ".join(html.escape(s["name"]) for s in supps[:3])
                         await send_telegram(uid, "🌙 <b>Вечерние добавки</b>\n\nПора принять: " + names + "\n\nХорошего сна!")
                 
                 # Еженедельный отчёт — воскресенье 19:00
-                if u["notif_weekly_on"] and current_weekday == 6 and current_time == "19:00":
+                if (u["notif_weekly_on"] and current_weekday == 6 and current_time == "19:00"
+                        and await claim_notification(uid, "weekly_report", delivery_key)):
                     await send_weekly_report(uid)
         
         except asyncio.CancelledError:
@@ -457,7 +585,7 @@ async def health():
 
 
 @app.get("/api/bootstrap")
-async def bootstrap(user_id: int = Header(..., alias="X-User-Id")):
+async def bootstrap(user_id: int = Depends(authenticated_user)):
     return await fetch_user_state(user_id)
 
 
@@ -465,29 +593,32 @@ async def bootstrap(user_id: int = Header(..., alias="X-User-Id")):
 # WORKOUTS
 # ════════════════════════════════════════════════════════════════
 @app.get("/api/workouts")
-async def get_workouts(user_id: int = Header(..., alias="X-User-Id")):
+async def get_workouts(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC",
+            "SELECT id, client_id, date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC",
             user_id
         )
         return [dict(r) for r in rows]
 
 
 @app.post("/api/workouts")
-async def add_workout(w: "WorkoutIn", user_id: int = Header(..., alias="X-User-Id")):
+async def add_workout(w: "WorkoutIn", user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "INSERT INTO workouts (user_id, date, muscle, exercise, sets, reps, weight) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
-            user_id, w.date, w.muscle, w.exercise, w.sets, w.reps, w.weight
-        )
+        row = await conn.fetchrow("""
+            INSERT INTO workouts (user_id, client_id, date, muscle, exercise, sets, reps, weight)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            ON CONFLICT (user_id, client_id) WHERE client_id IS NOT NULL
+            DO UPDATE SET date=$3, muscle=$4, exercise=$5, sets=$6, reps=$7, weight=$8
+            RETURNING id
+        """, user_id, w.client_id, w.date, w.muscle, w.exercise, w.sets, w.reps, w.weight)
     return {"status": "ok", "id": row["id"]}
 
 
 @app.delete("/api/workouts/{workout_id}")
-async def delete_workout(workout_id: int, user_id: int = Header(..., alias="X-User-Id")):
+async def delete_workout(workout_id: int, user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         result = await conn.execute(
@@ -500,7 +631,7 @@ async def delete_workout(workout_id: int, user_id: int = Header(..., alias="X-Us
 
 
 @app.post("/api/workouts/bulk")
-async def bulk_import_workouts(payload: "BulkImportIn", user_id: int = Header(..., alias="X-User-Id")):
+async def bulk_import_workouts(payload: "BulkImportIn", user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -516,7 +647,7 @@ async def bulk_import_workouts(payload: "BulkImportIn", user_id: int = Header(..
 # TASKS
 # ════════════════════════════════════════════════════════════════
 @app.get("/api/tasks")
-async def get_tasks(user_id: int = Header(..., alias="X-User-Id")):
+async def get_tasks(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -527,7 +658,7 @@ async def get_tasks(user_id: int = Header(..., alias="X-User-Id")):
 
 
 @app.post("/api/tasks")
-async def upsert_task(t: "TaskIn", user_id: int = Header(..., alias="X-User-Id")):
+async def upsert_task(t: "TaskIn", user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -540,7 +671,7 @@ async def upsert_task(t: "TaskIn", user_id: int = Header(..., alias="X-User-Id")
 
 
 @app.delete("/api/tasks/{task_id}")
-async def delete_task(task_id: str, user_id: int = Header(..., alias="X-User-Id")):
+async def delete_task(task_id: str, user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM tasks WHERE id=$1 AND user_id=$2", task_id, user_id)
@@ -551,29 +682,32 @@ async def delete_task(task_id: str, user_id: int = Header(..., alias="X-User-Id"
 # SUPPLEMENTS
 # ════════════════════════════════════════════════════════════════
 @app.get("/api/supplements")
-async def get_supplements(user_id: int = Header(..., alias="X-User-Id")):
+async def get_supplements(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, name, emoji, dose, times FROM supplements WHERE user_id=$1",
+            "SELECT id, client_id, name, emoji, dose, times FROM supplements WHERE user_id=$1",
             user_id
         )
         return [dict(r) | {"times": parse_times(r["times"])} for r in rows]
 
 
 @app.post("/api/supplements")
-async def add_supplement(s: "SupplementIn", user_id: int = Header(..., alias="X-User-Id")):
+async def add_supplement(s: "SupplementIn", user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "INSERT INTO supplements (user_id, name, emoji, dose, times) VALUES ($1,$2,$3,$4,$5) RETURNING id",
-            user_id, s.name, s.emoji, s.dose, json.dumps(s.times)
-        )
+        row = await conn.fetchrow("""
+            INSERT INTO supplements (user_id, client_id, name, emoji, dose, times)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            ON CONFLICT (user_id, client_id) WHERE client_id IS NOT NULL
+            DO UPDATE SET name=$3, emoji=$4, dose=$5, times=$6
+            RETURNING id
+        """, user_id, s.client_id, s.name, s.emoji, s.dose, json.dumps(s.times))
     return {"status": "ok", "id": row["id"]}
 
 
 @app.delete("/api/supplements/{supp_id}")
-async def delete_supplement(supp_id: int, user_id: int = Header(..., alias="X-User-Id")):
+async def delete_supplement(supp_id: int, user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM supplements WHERE id=$1 AND user_id=$2", supp_id, user_id)
@@ -581,7 +715,7 @@ async def delete_supplement(supp_id: int, user_id: int = Header(..., alias="X-Us
 
 
 @app.get("/api/supplement_checks")
-async def get_supp_checks(user_id: int = Header(..., alias="X-User-Id")):
+async def get_supp_checks(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -592,7 +726,7 @@ async def get_supp_checks(user_id: int = Header(..., alias="X-User-Id")):
 
 
 @app.post("/api/supplement_checks")
-async def toggle_supp_check(c: "SuppCheckIn", user_id: int = Header(..., alias="X-User-Id")):
+async def toggle_supp_check(c: "SuppCheckIn", user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         if c.checked:
@@ -610,10 +744,10 @@ async def toggle_supp_check(c: "SuppCheckIn", user_id: int = Header(..., alias="
 
 
 # ════════════════════════════════════════════════════════════════
-# BODY (weight + calories)
+# BODY (weight + calories + measurements)
 # ════════════════════════════════════════════════════════════════
 @app.get("/api/body/weight")
-async def get_body_weight(user_id: int = Header(..., alias="X-User-Id")):
+async def get_body_weight(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -623,7 +757,7 @@ async def get_body_weight(user_id: int = Header(..., alias="X-User-Id")):
 
 
 @app.post("/api/body/weight")
-async def upsert_body_weight(b: "BodyWeightIn", user_id: int = Header(..., alias="X-User-Id")):
+async def upsert_body_weight(b: "BodyWeightIn", user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -634,7 +768,7 @@ async def upsert_body_weight(b: "BodyWeightIn", user_id: int = Header(..., alias
 
 
 @app.delete("/api/body/weight/{entry_date}")
-async def delete_body_weight(entry_date: date, user_id: int = Header(..., alias="X-User-Id")):
+async def delete_body_weight(entry_date: date, user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         await conn.execute(
@@ -645,7 +779,7 @@ async def delete_body_weight(entry_date: date, user_id: int = Header(..., alias=
 
 
 @app.get("/api/body/calories")
-async def get_body_calories(user_id: int = Header(..., alias="X-User-Id")):
+async def get_body_calories(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -655,7 +789,7 @@ async def get_body_calories(user_id: int = Header(..., alias="X-User-Id")):
 
 
 @app.post("/api/body/calories")
-async def upsert_body_calories(b: "BodyCalIn", user_id: int = Header(..., alias="X-User-Id")):
+async def upsert_body_calories(b: "BodyCalIn", user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -666,11 +800,52 @@ async def upsert_body_calories(b: "BodyCalIn", user_id: int = Header(..., alias=
 
 
 @app.delete("/api/body/calories/{entry_date}")
-async def delete_body_calories(entry_date: date, user_id: int = Header(..., alias="X-User-Id")):
+async def delete_body_calories(entry_date: date, user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         await conn.execute(
             "DELETE FROM body_calories WHERE user_id=$1 AND date=$2",
+            user_id, entry_date
+        )
+    return {"status": "ok"}
+
+
+@app.get("/api/body/measures")
+async def get_body_measures(user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT date, weight, height, chest, waist, hips, fat, muscle FROM body_measures WHERE user_id=$1 ORDER BY date",
+            user_id
+        )
+        return [dict(r) for r in rows]
+
+
+@app.post("/api/body/measures")
+async def upsert_body_measures(b: "BodyMeasureIn", user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("""
+                INSERT INTO body_measures (user_id, date, weight, height, chest, waist, hips, fat, muscle)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                ON CONFLICT (user_id, date) DO UPDATE SET
+                    weight=$3, height=$4, chest=$5, waist=$6, hips=$7,
+                    fat=$8, muscle=$9, updated_at=now()
+            """, user_id, b.date, b.weight, b.height, b.chest, b.waist, b.hips, b.fat, b.muscle)
+            await conn.execute("""
+                INSERT INTO body_weight (user_id, date, weight) VALUES ($1,$2,$3)
+                ON CONFLICT (user_id, date) DO UPDATE SET weight=$3
+            """, user_id, b.date, b.weight)
+    return {"status": "ok"}
+
+
+@app.delete("/api/body/measures/{entry_date}")
+async def delete_body_measures(entry_date: date, user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM body_measures WHERE user_id=$1 AND date=$2",
             user_id, entry_date
         )
     return {"status": "ok"}
@@ -701,7 +876,7 @@ def parse_off_product(p: dict) -> dict:
 
 
 @app.get("/api/food/search")
-async def search_food(q: str, user_id: int = Header(..., alias="X-User-Id")):
+async def search_food(q: str, user_id: int = Depends(authenticated_user)):
     """Поиск еды через Open Food Facts — пробуем несколько эндпоинтов."""
     urls = [
         ("https://world.openfoodfacts.org/cgi/search.pl", {
@@ -740,7 +915,7 @@ async def search_food(q: str, user_id: int = Header(..., alias="X-User-Id")):
 
 
 @app.get("/api/food/barcode")
-async def search_by_barcode(barcode: str, user_id: int = Header(..., alias="X-User-Id")):
+async def search_by_barcode(barcode: str, user_id: int = Depends(authenticated_user)):
     """Поиск еды по штрихкоду через Open Food Facts."""
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -763,7 +938,7 @@ async def search_by_barcode(barcode: str, user_id: int = Header(..., alias="X-Us
 
 
 @app.get("/api/food/log")
-async def get_food_log(log_date: Optional[str] = None, user_id: int = Header(..., alias="X-User-Id")):
+async def get_food_log(log_date: Optional[str] = None, user_id: int = Depends(authenticated_user)):
     """Получить лог питания за день."""
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
@@ -781,21 +956,25 @@ async def get_food_log(log_date: Optional[str] = None, user_id: int = Header(...
 
 
 @app.post("/api/food/log")
-async def add_food_log(entry: "FoodLogIn", user_id: int = Header(..., alias="X-User-Id")):
+async def add_food_log(entry: "FoodLogIn", user_id: int = Depends(authenticated_user)):
     """Добавить еду в дневник."""
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO food_log (user_id, date, meal_type, food_id, food_name, serving_desc,
+            INSERT INTO food_log (user_id, client_id, date, meal_type, food_id, food_name, serving_desc,
                                   calories, protein, fat, carbs, amount)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id
-        """, user_id, entry.date, entry.meal_type, entry.food_id, entry.food_name,
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            ON CONFLICT (user_id, client_id) WHERE client_id IS NOT NULL
+            DO UPDATE SET date=$3, meal_type=$4, food_id=$5, food_name=$6,
+                          serving_desc=$7, calories=$8, protein=$9, fat=$10, carbs=$11, amount=$12
+            RETURNING id
+        """, user_id, entry.client_id, entry.date, entry.meal_type, entry.food_id, entry.food_name,
             entry.serving_desc, entry.calories, entry.protein, entry.fat, entry.carbs, entry.amount)
     return {"status": "ok", "id": row["id"]}
 
 
 @app.delete("/api/food/log/{entry_id}")
-async def delete_food_log(entry_id: int, user_id: int = Header(..., alias="X-User-Id")):
+async def delete_food_log(entry_id: int, user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM food_log WHERE id=$1 AND user_id=$2", entry_id, user_id)
@@ -806,7 +985,7 @@ async def delete_food_log(entry_id: int, user_id: int = Header(..., alias="X-Use
 # ИИ АНАЛИЗ — прогресс и плато через Claude
 # ════════════════════════════════════════════════════════════════
 @app.get("/api/ai/analysis")
-async def ai_analysis(user_id: int = Header(..., alias="X-User-Id")):
+async def ai_analysis(user_id: int = Depends(authenticated_user)):
     """Анализ прогресса, плато и рекомендации через Groq (Llama 3.3 70B)."""
     await ensure_user_settings(user_id)
     if not GROQ_API_KEY:
@@ -916,7 +1095,7 @@ async def ai_analysis(user_id: int = Header(..., alias="X-User-Id")):
 # EXPORT
 # ════════════════════════════════════════════════════════════════
 @app.get("/api/export")
-async def export_all(user_id: int = Header(..., alias="X-User-Id")):
+async def export_all(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         workouts = await conn.fetch("SELECT date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1", user_id)
@@ -925,6 +1104,7 @@ async def export_all(user_id: int = Header(..., alias="X-User-Id")):
         checks = await conn.fetch("SELECT date, supp_name, time_slot, checked FROM supplement_checks WHERE user_id=$1", user_id)
         weight = await conn.fetch("SELECT date, weight FROM body_weight WHERE user_id=$1", user_id)
         cal = await conn.fetch("SELECT date, calories FROM body_calories WHERE user_id=$1", user_id)
+        measures = await conn.fetch("SELECT date, weight, height, chest, waist, hips, fat, muscle FROM body_measures WHERE user_id=$1", user_id)
         food = await conn.fetch("SELECT date, meal_type, food_name, calories, protein, fat, carbs, amount FROM food_log WHERE user_id=$1", user_id)
 
     return {
@@ -936,6 +1116,7 @@ async def export_all(user_id: int = Header(..., alias="X-User-Id")):
         "supplement_checks": [dict(r) for r in checks],
         "body_weight": [dict(r) for r in weight],
         "body_calories": [dict(r) for r in cal],
+        "body_measures": [dict(r) for r in measures],
         "food_log": [dict(r) for r in food],
     }
 
