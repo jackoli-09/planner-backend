@@ -27,7 +27,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ALLOW_INSECURE_DEMO = os.environ.get("ALLOW_INSECURE_DEMO", "false").lower() == "true"
 ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get(
     "ALLOWED_ORIGINS",
-    "https://jackoli-09.github.io,http://127.0.0.1:8134,http://localhost:8134"
+    "https://planner-frontend-sable.vercel.app,https://jackoli-09.github.io,http://127.0.0.1:8134,http://localhost:8134"
 ).split(",") if origin.strip()]
 TZ = ZoneInfo("Europe/Moscow")
 
