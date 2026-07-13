@@ -112,6 +112,18 @@ class FoodLogIn(BaseModel):
     carbs: Optional[float] = None
     amount: float = 1.0
 
+class FoodFavoriteIn(BaseModel):
+    client_id: str = Field(min_length=1, max_length=80)
+    food_id: str = Field(default="manual", max_length=160)
+    food_name: str = Field(min_length=1, max_length=200)
+    serving_desc: Optional[str] = Field(default=None, max_length=120)
+    calories: float = Field(default=0, ge=0, le=2000)
+    protein: float = Field(default=0, ge=0, le=500)
+    fat: float = Field(default=0, ge=0, le=500)
+    carbs: float = Field(default=0, ge=0, le=500)
+    amount: float = Field(default=100, ge=1, le=5000)
+    meal_type: Literal["завтрак", "обед", "ужин", "перекус"] = "перекус"
+
 class BulkImportIn(BaseModel):
     workouts: list[WorkoutIn] = []
 
@@ -318,6 +330,24 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_food_log_user ON food_log(user_id);
             CREATE INDEX IF NOT EXISTS idx_food_log_user_date ON food_log(user_id, date DESC);
 
+            CREATE TABLE IF NOT EXISTS food_favorites (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                client_id TEXT NOT NULL,
+                food_id TEXT NOT NULL,
+                food_name TEXT NOT NULL,
+                serving_desc TEXT,
+                calories NUMERIC DEFAULT 0,
+                protein NUMERIC DEFAULT 0,
+                fat NUMERIC DEFAULT 0,
+                carbs NUMERIC DEFAULT 0,
+                amount NUMERIC DEFAULT 100,
+                meal_type TEXT DEFAULT 'перекус',
+                created_at TIMESTAMPTZ DEFAULT now(),
+                UNIQUE (user_id, client_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_food_favorites_user ON food_favorites(user_id, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id BIGINT PRIMARY KEY,
                 notif_morning TEXT DEFAULT '08:00',
@@ -470,6 +500,10 @@ async def fetch_user_state(user_id: int) -> dict:
             "SELECT * FROM food_log WHERE user_id=$1 ORDER BY date DESC, created_at DESC LIMIT 100",
             user_id
         )
+        food_favorites = await conn.fetch(
+            "SELECT id, client_id, food_id, food_name, serving_desc, calories, protein, fat, carbs, amount, meal_type FROM food_favorites WHERE user_id=$1 ORDER BY created_at DESC",
+            user_id
+        )
         settings = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id=$1", user_id)
 
     daily_calories = {
@@ -492,6 +526,7 @@ async def fetch_user_state(user_id: int) -> dict:
         "body_calories": [daily_calories[key] for key in sorted(daily_calories)],
         "body_measures": [dict(r) for r in measures],
         "food_log_recent": [dict(r) for r in food_recent],
+        "food_favorites": [dict(r) for r in food_favorites],
     }
 
 
@@ -1110,6 +1145,44 @@ async def delete_food_log(entry_id: int, user_id: int = Depends(authenticated_us
     return {"status": "ok"}
 
 
+@app.get("/api/food/favorites")
+async def get_food_favorites(user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, client_id, food_id, food_name, serving_desc,
+                   calories, protein, fat, carbs, amount, meal_type
+            FROM food_favorites WHERE user_id=$1 ORDER BY created_at DESC
+        """, user_id)
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/food/favorites")
+async def save_food_favorite(entry: "FoodFavoriteIn", user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO food_favorites (
+                user_id, client_id, food_id, food_name, serving_desc,
+                calories, protein, fat, carbs, amount, meal_type
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            ON CONFLICT (user_id, client_id) DO UPDATE SET
+                food_id=$3, food_name=$4, serving_desc=$5, calories=$6,
+                protein=$7, fat=$8, carbs=$9, amount=$10, meal_type=$11
+            RETURNING id
+        """, user_id, entry.client_id, entry.food_id, entry.food_name, entry.serving_desc,
+             entry.calories, entry.protein, entry.fat, entry.carbs, entry.amount, entry.meal_type)
+    return {"status": "ok", "id": row["id"]}
+
+
+@app.delete("/api/food/favorites/{favorite_id}")
+async def delete_food_favorite(favorite_id: int, user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM food_favorites WHERE id=$1 AND user_id=$2", favorite_id, user_id)
+    return {"status": "ok"}
+
+
 # ════════════════════════════════════════════════════════════════
 # ИИ АНАЛИЗ — прогресс и плато через Claude
 # ════════════════════════════════════════════════════════════════
@@ -1234,7 +1307,8 @@ async def export_all(user_id: int = Depends(authenticated_user)):
         weight = await conn.fetch("SELECT date, weight FROM body_weight WHERE user_id=$1", user_id)
         cal = await conn.fetch("SELECT date, calories FROM body_calories WHERE user_id=$1", user_id)
         measures = await conn.fetch("SELECT date, weight, height, chest, waist, hips, fat, muscle FROM body_measures WHERE user_id=$1", user_id)
-        food = await conn.fetch("SELECT date, meal_type, food_name, calories, protein, fat, carbs, amount FROM food_log WHERE user_id=$1", user_id)
+        food = await conn.fetch("SELECT client_id, date, meal_type, food_id, food_name, serving_desc, calories, protein, fat, carbs, amount FROM food_log WHERE user_id=$1", user_id)
+        favorites = await conn.fetch("SELECT client_id, food_id, food_name, serving_desc, calories, protein, fat, carbs, amount, meal_type FROM food_favorites WHERE user_id=$1", user_id)
         settings = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id=$1", user_id)
 
     profile_keys = ["name", "goal", "sex", "age", "height", "weight", "target_weight",
@@ -1254,6 +1328,7 @@ async def export_all(user_id: int = Depends(authenticated_user)):
         "body_calories": [dict(r) for r in cal],
         "body_measures": [dict(r) for r in measures],
         "food_log": [dict(r) for r in food],
+        "food_favorites": [dict(r) for r in favorites],
         "profile": {key: settings[key] for key in profile_keys} if settings else {},
         "notifications": {key: settings[key] for key in notification_keys} if settings else {},
     }
