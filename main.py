@@ -25,6 +25,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ALLOW_INSECURE_DEMO = os.environ.get("ALLOW_INSECURE_DEMO", "false").lower() == "true"
+APP_ENV = os.environ.get("APP_ENV", "production").lower()
 ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get(
     "ALLOWED_ORIGINS",
     "https://planner-frontend-sable.vercel.app,https://jackoli-09.github.io,http://127.0.0.1:8134,http://localhost:8134"
@@ -126,12 +127,27 @@ class ProfileIn(BaseModel):
     calorie_goal: int = Field(ge=1200, le=6000)
     onboarding_completed: bool = True
 
+class NotificationSettingsIn(BaseModel):
+    notif_morning: time = time(8, 0)
+    notif_morning_on: bool = True
+    notif_workout: time = time(10, 0)
+    notif_workout_on: bool = True
+    notif_evening: time = time(21, 0)
+    notif_evening_on: bool = True
+    notif_tasks: time = time(20, 0)
+    notif_tasks_on: bool = True
+    notif_weekly: time = time(19, 0)
+    notif_weekly_on: bool = True
+    timezone: str = Field(default="Europe/Moscow", min_length=1, max_length=64)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is required for persistent product storage")
+    if ALLOW_INSECURE_DEMO and APP_ENV not in {"development", "test"}:
+        raise RuntimeError("ALLOW_INSECURE_DEMO is forbidden outside development and test")
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, command_timeout=30)
     await init_db()
     # Запускаем планировщик уведомлений
@@ -310,6 +326,9 @@ async def init_db():
                 notif_workout_on BOOLEAN DEFAULT TRUE,
                 notif_evening TEXT DEFAULT '21:00',
                 notif_evening_on BOOLEAN DEFAULT TRUE,
+                notif_tasks TEXT DEFAULT '20:00',
+                notif_tasks_on BOOLEAN DEFAULT TRUE,
+                notif_weekly TEXT DEFAULT '19:00',
                 notif_weekly_on BOOLEAN DEFAULT TRUE,
                 timezone TEXT DEFAULT 'Europe/Moscow',
                 name TEXT,
@@ -362,6 +381,9 @@ async def init_db():
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS activity TEXT")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS calorie_goal INT")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS notif_tasks TEXT DEFAULT '20:00'")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS notif_tasks_on BOOLEAN DEFAULT TRUE")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS notif_weekly TEXT DEFAULT '19:00'")
         await conn.execute("ALTER TABLE food_log ADD COLUMN IF NOT EXISTS client_id TEXT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_food_log_user_client ON food_log(user_id, client_id) WHERE client_id IS NOT NULL")
         await conn.execute("ALTER TABLE workouts ADD COLUMN IF NOT EXISTS client_id TEXT")
@@ -557,9 +579,23 @@ async def notification_scheduler():
                     if supps:
                         names = ", ".join(html.escape(s["name"]) for s in supps[:3])
                         await send_telegram(uid, "🌙 <b>Вечерние добавки</b>\n\nПора принять: " + names + "\n\nХорошего сна!")
+
+                # Незавершенные задачи
+                if (u["notif_tasks_on"] and u["notif_tasks"] == current_time
+                        and await claim_notification(uid, "tasks", delivery_key)):
+                    async with pool.acquire() as conn:
+                        remaining = await conn.fetchval(
+                            "SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND done=FALSE AND (dl IS NULL OR dl<=$2)",
+                            uid, now.date()
+                        )
+                    if remaining:
+                        await send_telegram(
+                            uid,
+                            f"📋 <b>Осталось задач: {remaining}</b>\n\nЗакрой главное или перенеси дела на другой день."
+                        )
                 
                 # Еженедельный отчёт — воскресенье 19:00
-                if (u["notif_weekly_on"] and current_weekday == 6 and current_time == "19:00"
+                if (u["notif_weekly_on"] and current_weekday == 6 and current_time == u["notif_weekly"]
                         and await claim_notification(uid, "weekly_report", delivery_key)):
                     await send_weekly_report(uid)
         
@@ -645,6 +681,38 @@ async def save_profile(profile: "ProfileIn", user_id: int = Depends(authenticate
         """, user_id, profile.name, profile.goal, profile.sex, profile.age,
              profile.height, profile.weight, profile.target_weight, profile.activity,
              profile.calorie_goal, profile.onboarding_completed)
+    return dict(row)
+
+
+@app.post("/api/settings/notifications")
+async def save_notification_settings(
+    settings: "NotificationSettingsIn",
+    user_id: int = Depends(authenticated_user),
+):
+    try:
+        ZoneInfo(settings.timezone)
+    except Exception:
+        raise HTTPException(422, "Invalid timezone")
+    await ensure_user_settings(user_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE user_settings SET
+                notif_morning=$2, notif_morning_on=$3,
+                notif_workout=$4, notif_workout_on=$5,
+                notif_evening=$6, notif_evening_on=$7,
+                notif_tasks=$8, notif_tasks_on=$9,
+                notif_weekly=$10, notif_weekly_on=$11,
+                timezone=$12, updated_at=now()
+            WHERE user_id=$1
+            RETURNING notif_morning, notif_morning_on, notif_workout, notif_workout_on,
+                      notif_evening, notif_evening_on, notif_tasks, notif_tasks_on,
+                      notif_weekly, notif_weekly_on, timezone, updated_at
+        """, user_id, settings.notif_morning.strftime("%H:%M"), settings.notif_morning_on,
+             settings.notif_workout.strftime("%H:%M"), settings.notif_workout_on,
+             settings.notif_evening.strftime("%H:%M"), settings.notif_evening_on,
+             settings.notif_tasks.strftime("%H:%M"), settings.notif_tasks_on,
+             settings.notif_weekly.strftime("%H:%M"), settings.notif_weekly_on,
+             settings.timezone)
     return dict(row)
 
 
@@ -1167,7 +1235,13 @@ async def export_all(user_id: int = Depends(authenticated_user)):
         cal = await conn.fetch("SELECT date, calories FROM body_calories WHERE user_id=$1", user_id)
         measures = await conn.fetch("SELECT date, weight, height, chest, waist, hips, fat, muscle FROM body_measures WHERE user_id=$1", user_id)
         food = await conn.fetch("SELECT date, meal_type, food_name, calories, protein, fat, carbs, amount FROM food_log WHERE user_id=$1", user_id)
-        settings = await conn.fetchrow("SELECT name, goal, sex, age, height, weight, target_weight, activity, calorie_goal, onboarding_completed, updated_at FROM user_settings WHERE user_id=$1", user_id)
+        settings = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id=$1", user_id)
+
+    profile_keys = ["name", "goal", "sex", "age", "height", "weight", "target_weight",
+                    "activity", "calorie_goal", "onboarding_completed", "updated_at"]
+    notification_keys = ["notif_morning", "notif_morning_on", "notif_workout", "notif_workout_on",
+                         "notif_evening", "notif_evening_on", "notif_tasks", "notif_tasks_on",
+                         "notif_weekly", "notif_weekly_on", "timezone", "updated_at"]
 
     return {
         "exported_at": str(date.today()),
@@ -1180,7 +1254,8 @@ async def export_all(user_id: int = Depends(authenticated_user)):
         "body_calories": [dict(r) for r in cal],
         "body_measures": [dict(r) for r in measures],
         "food_log": [dict(r) for r in food],
-        "profile": dict(settings) if settings else {},
+        "profile": {key: settings[key] for key in profile_keys} if settings else {},
+        "notifications": {key: settings[key] for key in notification_keys} if settings else {},
     }
 
 
