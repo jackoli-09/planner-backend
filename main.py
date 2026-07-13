@@ -68,6 +68,19 @@ class TaskIn(BaseModel):
     duration_minutes: int = Field(default=30, ge=5, le=1440)
     repeat_rule: Literal["none", "daily", "weekdays", "weekly"] = "none"
 
+class TaskTemplateItem(BaseModel):
+    text: str = Field(min_length=1, max_length=200)
+    prio: Literal["h", "m", "l"] = "m"
+    cat: Optional[str] = Field(default=None, max_length=80)
+    start_time: Optional[time] = None
+    duration_minutes: int = Field(default=30, ge=5, le=1440)
+    repeat_rule: Literal["none", "daily", "weekdays", "weekly"] = "none"
+
+class TaskTemplateIn(BaseModel):
+    client_id: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=80)
+    tasks: list[TaskTemplateItem] = Field(min_length=1, max_length=20)
+
 class SupplementIn(BaseModel):
     client_id: Optional[str] = None
     name: str
@@ -260,6 +273,17 @@ async def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_user_done ON tasks(user_id, done);
+
+            CREATE TABLE IF NOT EXISTS task_templates (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                client_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                tasks JSONB NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                UNIQUE (user_id, client_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_templates_user ON task_templates(user_id, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS supplements (
                 id SERIAL PRIMARY KEY,
@@ -471,6 +495,10 @@ async def fetch_user_state(user_id: int) -> dict:
             "SELECT id, text, prio, dl, cat, done, start_time, duration_minutes, repeat_rule FROM tasks WHERE user_id=$1 ORDER BY created_at DESC",
             user_id
         )
+        task_templates = await conn.fetch(
+            "SELECT id, client_id, name, tasks FROM task_templates WHERE user_id=$1 ORDER BY created_at DESC",
+            user_id
+        )
         supps = await conn.fetch(
             "SELECT id, client_id, name, emoji, dose, times FROM supplements WHERE user_id=$1 ORDER BY id",
             user_id
@@ -520,6 +548,7 @@ async def fetch_user_state(user_id: int) -> dict:
         "settings": dict(settings) if settings else {},
         "workouts": [dict(r) for r in workouts],
         "tasks": [dict(r) for r in tasks],
+        "task_templates": [dict(r) | {"tasks": parse_times(r["tasks"])} for r in task_templates],
         "supplements": [dict(r) | {"times": parse_times(r["times"])} for r in supps],
         "supplement_checks": [dict(r) for r in checks],
         "body_weight": [dict(r) for r in weight],
@@ -839,6 +868,39 @@ async def delete_task(task_id: str, user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM tasks WHERE id=$1 AND user_id=$2", task_id, user_id)
+    return {"status": "ok"}
+
+
+@app.get("/api/task-templates")
+async def get_task_templates(user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, client_id, name, tasks FROM task_templates WHERE user_id=$1 ORDER BY created_at DESC",
+            user_id
+        )
+    return [dict(row) | {"tasks": parse_times(row["tasks"])} for row in rows]
+
+
+@app.post("/api/task-templates")
+async def save_task_template(template: "TaskTemplateIn", user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    tasks = [item.model_dump(mode="json") for item in template.tasks]
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO task_templates (user_id, client_id, name, tasks)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (user_id, client_id) DO UPDATE SET name=$3, tasks=$4
+            RETURNING id
+        """, user_id, template.client_id, template.name, json.dumps(tasks))
+    return {"status": "ok", "id": row["id"]}
+
+
+@app.delete("/api/task-templates/{template_id}")
+async def delete_task_template(template_id: int, user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM task_templates WHERE id=$1 AND user_id=$2", template_id, user_id)
     return {"status": "ok"}
 
 
@@ -1302,6 +1364,7 @@ async def export_all(user_id: int = Depends(authenticated_user)):
     async with pool.acquire() as conn:
         workouts = await conn.fetch("SELECT date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1", user_id)
         tasks = await conn.fetch("SELECT id, text, prio, dl, cat, done, start_time, duration_minutes, repeat_rule FROM tasks WHERE user_id=$1", user_id)
+        task_templates = await conn.fetch("SELECT client_id, name, tasks FROM task_templates WHERE user_id=$1", user_id)
         supps = await conn.fetch("SELECT name, emoji, dose, times FROM supplements WHERE user_id=$1", user_id)
         checks = await conn.fetch("SELECT date, supp_name, time_slot, checked FROM supplement_checks WHERE user_id=$1", user_id)
         weight = await conn.fetch("SELECT date, weight FROM body_weight WHERE user_id=$1", user_id)
@@ -1322,6 +1385,7 @@ async def export_all(user_id: int = Depends(authenticated_user)):
         "user_id": user_id,
         "workouts": [dict(r) for r in workouts],
         "tasks": [dict(r) for r in tasks],
+        "task_templates": [dict(r) | {"tasks": parse_times(r["tasks"])} for r in task_templates],
         "supplements": [dict(r) | {"times": parse_times(r["times"])} for r in supps],
         "supplement_checks": [dict(r) for r in checks],
         "body_weight": [dict(r) for r in weight],
