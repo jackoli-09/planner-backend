@@ -11,14 +11,14 @@ import hmac
 import html
 import time as unix_time
 from datetime import date, datetime, time
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
 import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -63,6 +63,9 @@ class TaskIn(BaseModel):
     dl: Optional[date] = None
     cat: Optional[str] = None
     done: bool = False
+    start_time: Optional[time] = None
+    duration_minutes: int = Field(default=30, ge=5, le=1440)
+    repeat_rule: Literal["none", "daily", "weekdays", "weekly"] = "none"
 
 class SupplementIn(BaseModel):
     client_id: Optional[str] = None
@@ -209,6 +212,9 @@ async def init_db():
                 dl DATE,
                 cat TEXT,
                 done BOOLEAN DEFAULT FALSE,
+                start_time TIME,
+                duration_minutes INT DEFAULT 30,
+                repeat_rule TEXT DEFAULT 'none',
                 created_at TIMESTAMPTZ DEFAULT now(),
                 PRIMARY KEY (user_id, id)
             );
@@ -330,6 +336,9 @@ async def init_db():
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_workouts_user_client ON workouts(user_id, client_id) WHERE client_id IS NOT NULL")
         await conn.execute("ALTER TABLE supplements ADD COLUMN IF NOT EXISTS client_id TEXT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_supplements_user_client ON supplements(user_id, client_id) WHERE client_id IS NOT NULL")
+        await conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS start_time TIME")
+        await conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS duration_minutes INT DEFAULT 30")
+        await conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS repeat_rule TEXT DEFAULT 'none'")
 
 
 async def ensure_user_settings(user_id: int):
@@ -375,7 +384,7 @@ async def fetch_user_state(user_id: int) -> dict:
             user_id
         )
         tasks = await conn.fetch(
-            "SELECT id, text, prio, dl, cat, done FROM tasks WHERE user_id=$1 ORDER BY created_at DESC",
+            "SELECT id, text, prio, dl, cat, done, start_time, duration_minutes, repeat_rule FROM tasks WHERE user_id=$1 ORDER BY created_at DESC",
             user_id
         )
         supps = await conn.fetch(
@@ -651,7 +660,7 @@ async def get_tasks(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, text, prio, dl, cat, done FROM tasks WHERE user_id=$1 ORDER BY created_at DESC",
+            "SELECT id, text, prio, dl, cat, done, start_time, duration_minutes, repeat_rule FROM tasks WHERE user_id=$1 ORDER BY created_at DESC",
             user_id
         )
         return [dict(r) for r in rows]
@@ -662,11 +671,13 @@ async def upsert_task(t: "TaskIn", user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO tasks (id, user_id, text, prio, dl, cat, done)
-            VALUES ($1,$2,$3,$4,$5,$6,$7)
+            INSERT INTO tasks (id, user_id, text, prio, dl, cat, done, start_time, duration_minutes, repeat_rule)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT (user_id, id) DO UPDATE
-            SET text=$3, prio=$4, dl=$5, cat=$6, done=$7
-        """, t.id, user_id, t.text, t.prio, t.dl, t.cat, t.done)
+            SET text=$3, prio=$4, dl=$5, cat=$6, done=$7,
+                start_time=$8, duration_minutes=$9, repeat_rule=$10
+        """, t.id, user_id, t.text, t.prio, t.dl, t.cat, t.done,
+             t.start_time, max(5, min(t.duration_minutes, 1440)), t.repeat_rule)
     return {"status": "ok"}
 
 
@@ -1099,7 +1110,7 @@ async def export_all(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         workouts = await conn.fetch("SELECT date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1", user_id)
-        tasks = await conn.fetch("SELECT id, text, prio, dl, cat, done FROM tasks WHERE user_id=$1", user_id)
+        tasks = await conn.fetch("SELECT id, text, prio, dl, cat, done, start_time, duration_minutes, repeat_rule FROM tasks WHERE user_id=$1", user_id)
         supps = await conn.fetch("SELECT name, emoji, dose, times FROM supplements WHERE user_id=$1", user_id)
         checks = await conn.fetch("SELECT date, supp_name, time_slot, checked FROM supplement_checks WHERE user_id=$1", user_id)
         weight = await conn.fetch("SELECT date, weight FROM body_weight WHERE user_id=$1", user_id)
