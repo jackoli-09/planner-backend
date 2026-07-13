@@ -114,6 +114,18 @@ class FoodLogIn(BaseModel):
 class BulkImportIn(BaseModel):
     workouts: list[WorkoutIn] = []
 
+class ProfileIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    goal: Literal["lose", "maintain", "gain"]
+    sex: Literal["male", "female"]
+    age: int = Field(ge=18, le=100)
+    height: float = Field(ge=120, le=230)
+    weight: float = Field(ge=35, le=350)
+    target_weight: Optional[float] = Field(default=None, ge=35, le=350)
+    activity: Literal["low", "light", "medium", "high"]
+    calorie_goal: int = Field(ge=1200, le=6000)
+    onboarding_completed: bool = True
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -300,6 +312,16 @@ async def init_db():
                 notif_evening_on BOOLEAN DEFAULT TRUE,
                 notif_weekly_on BOOLEAN DEFAULT TRUE,
                 timezone TEXT DEFAULT 'Europe/Moscow',
+                name TEXT,
+                goal TEXT,
+                sex TEXT,
+                age INT,
+                height NUMERIC,
+                weight NUMERIC,
+                target_weight NUMERIC,
+                activity TEXT,
+                calorie_goal INT,
+                onboarding_completed BOOLEAN DEFAULT FALSE,
                 seeded_defaults BOOLEAN DEFAULT FALSE,
                 updated_at TIMESTAMPTZ DEFAULT now()
             );
@@ -330,6 +352,16 @@ async def init_db():
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS seeded_defaults BOOLEAN DEFAULT FALSE")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'Europe/Moscow'")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS name TEXT")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS goal TEXT")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS sex TEXT")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS age INT")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS height NUMERIC")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS weight NUMERIC")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS target_weight NUMERIC")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS activity TEXT")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS calorie_goal INT")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE")
         await conn.execute("ALTER TABLE food_log ADD COLUMN IF NOT EXISTS client_id TEXT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_food_log_user_client ON food_log(user_id, client_id) WHERE client_id IS NOT NULL")
         await conn.execute("ALTER TABLE workouts ADD COLUMN IF NOT EXISTS client_id TEXT")
@@ -596,6 +628,24 @@ async def health():
 @app.get("/api/bootstrap")
 async def bootstrap(user_id: int = Depends(authenticated_user)):
     return await fetch_user_state(user_id)
+
+
+@app.post("/api/settings/profile")
+async def save_profile(profile: "ProfileIn", user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE user_settings SET
+                name=$2, goal=$3, sex=$4, age=$5, height=$6, weight=$7,
+                target_weight=$8, activity=$9, calorie_goal=$10,
+                onboarding_completed=$11, updated_at=now()
+            WHERE user_id=$1
+            RETURNING name, goal, sex, age, height, weight, target_weight,
+                      activity, calorie_goal, onboarding_completed, updated_at
+        """, user_id, profile.name, profile.goal, profile.sex, profile.age,
+             profile.height, profile.weight, profile.target_weight, profile.activity,
+             profile.calorie_goal, profile.onboarding_completed)
+    return dict(row)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1117,6 +1167,7 @@ async def export_all(user_id: int = Depends(authenticated_user)):
         cal = await conn.fetch("SELECT date, calories FROM body_calories WHERE user_id=$1", user_id)
         measures = await conn.fetch("SELECT date, weight, height, chest, waist, hips, fat, muscle FROM body_measures WHERE user_id=$1", user_id)
         food = await conn.fetch("SELECT date, meal_type, food_name, calories, protein, fat, carbs, amount FROM food_log WHERE user_id=$1", user_id)
+        settings = await conn.fetchrow("SELECT name, goal, sex, age, height, weight, target_weight, activity, calorie_goal, onboarding_completed, updated_at FROM user_settings WHERE user_id=$1", user_id)
 
     return {
         "exported_at": str(date.today()),
@@ -1129,6 +1180,7 @@ async def export_all(user_id: int = Depends(authenticated_user)):
         "body_calories": [dict(r) for r in cal],
         "body_measures": [dict(r) for r in measures],
         "food_log": [dict(r) for r in food],
+        "profile": dict(settings) if settings else {},
     }
 
 
