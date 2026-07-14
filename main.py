@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://planner-frontend-sable.vercel.app")
 ALLOW_INSECURE_DEMO = os.environ.get("ALLOW_INSECURE_DEMO", "false").lower() == "true"
 APP_ENV = os.environ.get("APP_ENV", "production").lower()
 ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get(
@@ -35,6 +36,7 @@ TZ = ZoneInfo("Europe/Moscow")
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", str(90 * 24 * 60 * 60)))
 
 pool: Optional[asyncpg.Pool] = None
+telegram_menu_configured = False
 import logging
 
 DEFAULT_SUPPLEMENTS = [
@@ -170,13 +172,14 @@ class NotificationSettingsIn(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool
+    global pool, telegram_menu_configured
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is required for persistent product storage")
     if ALLOW_INSECURE_DEMO and APP_ENV not in {"development", "test"}:
         raise RuntimeError("ALLOW_INSECURE_DEMO is forbidden outside development and test")
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, command_timeout=30)
     await init_db()
+    telegram_menu_configured = await configure_telegram_menu_button()
     # Запускаем планировщик уведомлений
     task = asyncio.create_task(notification_scheduler())
     yield
@@ -193,6 +196,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+async def configure_telegram_menu_button() -> bool:
+    if not BOT_TOKEN:
+        logging.error("BOT_TOKEN is missing; Telegram Mini App menu cannot be configured")
+        return False
+    payload = {
+        "menu_button": {
+            "type": "web_app",
+            "text": "Открыть планировщик",
+            "web_app": {"url": FRONTEND_URL},
+        }
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/setChatMenuButton",
+                json=payload,
+            )
+        data = response.json()
+        if response.is_success and data.get("ok") is True:
+            return True
+        logging.error("Telegram menu configuration failed: HTTP %s", response.status_code)
+    except Exception:
+        logging.exception("Telegram menu configuration failed")
+    return False
 
 
 def verify_telegram_init_data(init_data: str, max_age_seconds: int = 86400) -> int:
@@ -755,7 +784,10 @@ async def health():
     try:
         async with pool.acquire() as conn:
             value = await conn.fetchval("SELECT 1")
-        return {"status": "ok", "database": "ok", "value": value}
+        return {
+            "status": "ok", "database": "ok", "value": value,
+            "telegram_menu": "ok" if telegram_menu_configured else "error",
+        }
     except Exception as e:
         logging.exception("Healthcheck failed")
         raise HTTPException(503, f"Database unavailable: {type(e).__name__}")
