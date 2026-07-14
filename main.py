@@ -37,6 +37,7 @@ SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", str(90 * 24 * 60
 
 pool: Optional[asyncpg.Pool] = None
 telegram_menu_configured = False
+telegram_menu_status = "not_checked"
 import logging
 
 DEFAULT_SUPPLEMENTS = [
@@ -199,7 +200,9 @@ app.add_middleware(
 
 
 async def configure_telegram_menu_button() -> bool:
+    global telegram_menu_status
     if not BOT_TOKEN:
+        telegram_menu_status = "bot_token_missing"
         logging.error("BOT_TOKEN is missing; Telegram Mini App menu cannot be configured")
         return False
     payload = {
@@ -217,9 +220,18 @@ async def configure_telegram_menu_button() -> bool:
             )
         data = response.json()
         if response.is_success and data.get("ok") is True:
+            telegram_menu_status = "ok"
             return True
-        logging.error("Telegram menu configuration failed: HTTP %s", response.status_code)
-    except Exception:
+        description = str(data.get("description") or "unknown").lower()
+        if response.status_code == 401:
+            telegram_menu_status = "telegram_unauthorized"
+        elif "url" in description or "web app" in description:
+            telegram_menu_status = "telegram_rejected_url"
+        else:
+            telegram_menu_status = f"telegram_http_{response.status_code}"
+        logging.error("Telegram menu configuration failed: HTTP %s: %s", response.status_code, description[:120])
+    except Exception as error:
+        telegram_menu_status = "network_error_" + type(error).__name__.lower()
         logging.exception("Telegram menu configuration failed")
     return False
 
@@ -787,6 +799,7 @@ async def health():
         return {
             "status": "ok", "database": "ok", "value": value,
             "telegram_menu": "ok" if telegram_menu_configured else "error",
+            "telegram_menu_status": telegram_menu_status,
         }
     except Exception as e:
         logging.exception("Healthcheck failed")
