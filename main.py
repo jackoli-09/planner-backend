@@ -4,6 +4,7 @@ FastAPI backend для Telegram Mini App "Мой планировщик"
 
 import os
 import json
+import base64
 import httpx
 import asyncio
 import hashlib
@@ -31,6 +32,7 @@ ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get(
     "https://planner-frontend-sable.vercel.app,https://jackoli-09.github.io,http://127.0.0.1:8134,http://localhost:8134"
 ).split(",") if origin.strip()]
 TZ = ZoneInfo("Europe/Moscow")
+SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", str(90 * 24 * 60 * 60)))
 
 pool: Optional[asyncpg.Pool] = None
 import logging
@@ -218,10 +220,44 @@ def verify_telegram_init_data(init_data: str, max_age_seconds: int = 86400) -> i
         raise HTTPException(401, "Invalid Telegram authorization")
 
 
+def create_session_token(user_id: int, ttl_seconds: int = SESSION_TTL_SECONDS) -> tuple[str, int]:
+    if not BOT_TOKEN:
+        raise HTTPException(503, "Telegram authentication is not configured")
+    expires_at = int(unix_time.time()) + ttl_seconds
+    payload = f"v1:{user_id}:{expires_at}"
+    signature = hmac.new(BOT_TOKEN.encode(), payload.encode(), hashlib.sha256).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
+    return f"{payload}:{encoded_signature}", expires_at
+
+
+def verify_session_token(token: str) -> int:
+    if not BOT_TOKEN:
+        raise HTTPException(503, "Telegram authentication is not configured")
+    try:
+        version, raw_user_id, raw_expires_at, received_signature = token.split(":", 3)
+        user_id = int(raw_user_id)
+        expires_at = int(raw_expires_at)
+        if version != "v1" or user_id <= 0 or expires_at <= int(unix_time.time()):
+            raise HTTPException(401, "Session has expired")
+        payload = f"{version}:{user_id}:{expires_at}"
+        signature = hmac.new(BOT_TOKEN.encode(), payload.encode(), hashlib.sha256).digest()
+        expected_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
+        if not hmac.compare_digest(expected_signature, received_signature):
+            raise HTTPException(401, "Invalid session")
+        return user_id
+    except HTTPException:
+        raise
+    except (TypeError, ValueError):
+        raise HTTPException(401, "Invalid session")
+
+
 async def authenticated_user(
     telegram_init_data: Optional[str] = Header(None, alias="X-Telegram-Init-Data"),
     demo_user_id: Optional[int] = Header(None, alias="X-User-Id"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
 ) -> int:
+    if authorization and authorization.startswith("Bearer "):
+        return verify_session_token(authorization[7:].strip())
     if telegram_init_data:
         return verify_telegram_init_data(telegram_init_data)
     if ALLOW_INSECURE_DEMO and demo_user_id and demo_user_id > 0:
@@ -723,6 +759,17 @@ async def health():
     except Exception as e:
         logging.exception("Healthcheck failed")
         raise HTTPException(503, f"Database unavailable: {type(e).__name__}")
+
+
+@app.post("/api/auth/session")
+async def create_auth_session(
+    telegram_init_data: Optional[str] = Header(None, alias="X-Telegram-Init-Data"),
+):
+    if not telegram_init_data:
+        raise HTTPException(401, "Open the planner inside Telegram")
+    user_id = verify_telegram_init_data(telegram_init_data, max_age_seconds=7 * 24 * 60 * 60)
+    token, expires_at = create_session_token(user_id)
+    return {"token": token, "user_id": user_id, "expires_at": expires_at}
 
 
 @app.get("/api/bootstrap")
