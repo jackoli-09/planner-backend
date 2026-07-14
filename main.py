@@ -49,6 +49,15 @@ DEFAULT_SUPPLEMENTS = [
     {"name": "Протеин", "emoji": "P", "dose": "30 г", "times": ["День"]},
 ]
 
+DEFAULT_WORKOUT_GROUPS = [
+    {"name": "Грудь + Трицепс", "short": "Грудь+Три", "exercises": ["Жим штанги лёжа", "Жим штанги на наклонной скамье", "Жим гантелей на наклонной скамье", "Разводка гантелей лёжа", "Сведение в тренажёре (Бабочка)", "Французский жим", "Разгибание на трицепс (блок)"]},
+    {"name": "Спина + Бицепс", "short": "Спина+Би", "exercises": ["Становая тяга", "Румынская тяга", "Тяга штанги в наклоне", "Тяга верхнего блока к груди", "Тяга нижнего блока к поясу", "Тяга нижнего блока одной рукой", "Тяга в хаммере", "Подъём штанги на бицепс", "Подъём EZ-штанги на бицепс", "Подъём гантелей на бицепс сидя", "Подъём гантелей на бицепс стоя", "Сгибание на скамье Скотта", "Молотки (Hammer Curl)"]},
+    {"name": "Ноги + Ягодицы", "short": "Ноги", "exercises": ["Приседания со штангой", "Жим ногами", "Разгибание ног (тренажёр)", "Сгибание ног (тренажёр)", "Выпады с гантелями", "Подъём на носки"]},
+    {"name": "Плечи + Трапеции", "short": "Плечи", "exercises": ["Жим гантелей сидя (плечи)", "Жим штанги стоя", "Подъём гантелей в стороны", "Подъём гантелей перед собой", "Разведение в тренажёре (задние дельты)", "Тяга к подбородку", "Шраги"]},
+    {"name": "Руки (Би + Три)", "short": "Руки", "exercises": ["Подъём штанги на бицепс", "Молотки (Hammer Curl)", "Французский жим", "Разгибание на трицепс (блок)"]},
+    {"name": "Пресс + Кор", "short": "Пресс", "exercises": ["Скручивания", "Подъём ног в висе", "Планка", "Боковая планка", "Велосипед", "Русский твист"]},
+]
+
 
 # ════════════════════════════════════════════════════════════════
 # MODELS
@@ -61,6 +70,14 @@ class WorkoutIn(BaseModel):
     sets: int
     reps: int
     weight: float
+
+class WorkoutGroupItem(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    short: Optional[str] = Field(default=None, max_length=24)
+    exercises: list[str] = Field(default_factory=list, max_length=40)
+
+class WorkoutGroupsIn(BaseModel):
+    groups: list[WorkoutGroupItem] = Field(min_length=1, max_length=24)
 
 class TaskIn(BaseModel):
     id: str
@@ -472,6 +489,7 @@ async def init_db():
                 activity TEXT,
                 calorie_goal INT,
                 onboarding_completed BOOLEAN DEFAULT FALSE,
+                workout_groups JSONB,
                 seeded_defaults BOOLEAN DEFAULT FALSE,
                 updated_at TIMESTAMPTZ DEFAULT now()
             );
@@ -512,6 +530,7 @@ async def init_db():
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS activity TEXT")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS calorie_goal INT")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS workout_groups JSONB")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS notif_tasks TEXT DEFAULT '20:00'")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS notif_tasks_on BOOLEAN DEFAULT TRUE")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS notif_weekly TEXT DEFAULT '19:00'")
@@ -535,8 +554,13 @@ async def ensure_user_settings(user_id: int):
         settings = await conn.fetchrow("""
             INSERT INTO user_settings (user_id) VALUES ($1)
             ON CONFLICT (user_id) DO UPDATE SET updated_at=user_settings.updated_at
-            RETURNING seeded_defaults
+            RETURNING seeded_defaults, workout_groups
         """, user_id)
+        if settings and not settings["workout_groups"]:
+            await conn.execute(
+                "UPDATE user_settings SET workout_groups=$2::jsonb WHERE user_id=$1",
+                user_id, json.dumps(DEFAULT_WORKOUT_GROUPS, ensure_ascii=False)
+            )
         if settings and not settings["seeded_defaults"]:
             async with conn.transaction():
                 for supp in DEFAULT_SUPPLEMENTS:
@@ -870,6 +894,36 @@ async def save_notification_settings(
              settings.notif_weekly.strftime("%H:%M"), settings.notif_weekly_on,
              settings.timezone)
     return dict(row)
+
+
+@app.post("/api/settings/workout-groups")
+async def save_workout_groups(
+    payload: "WorkoutGroupsIn",
+    user_id: int = Depends(authenticated_user),
+):
+    await ensure_user_settings(user_id)
+    groups = []
+    for group in payload.groups:
+        exercises = []
+        seen = set()
+        for raw in group.exercises:
+            name = str(raw or "").strip()
+            key = name.lower()
+            if name and key not in seen:
+                seen.add(key)
+                exercises.append(name[:120])
+        groups.append({
+            "name": group.name.strip(),
+            "short": (group.short or group.name).strip()[:24],
+            "exercises": exercises,
+        })
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE user_settings SET workout_groups=$2::jsonb, updated_at=now()
+            WHERE user_id=$1
+            RETURNING workout_groups, updated_at
+        """, user_id, json.dumps(groups, ensure_ascii=False))
+    return {"workout_groups": parse_times(row["workout_groups"]), "updated_at": row["updated_at"]}
 
 
 # ════════════════════════════════════════════════════════════════
