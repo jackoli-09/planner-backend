@@ -1501,6 +1501,116 @@ async def ai_analysis(user_id: int = Depends(authenticated_user)):
         raise HTTPException(500, f"AI error: {str(e)}")
 
 
+@app.get("/api/ai/day-plan")
+async def ai_day_plan(user_id: int = Depends(authenticated_user)):
+    """Собирает практичный план дня: задачи, питание и тренировочный фокус."""
+    await ensure_user_settings(user_id)
+    if not GROQ_API_KEY:
+        raise HTTPException(503, "AI not configured")
+
+    today = datetime.now(TZ).date()
+    async with pool.acquire() as conn:
+        settings = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id=$1", user_id)
+        tasks = await conn.fetch(
+            """SELECT text, prio, dl, cat, done, start_time, duration_minutes, repeat_rule
+               FROM tasks WHERE user_id=$1 AND done=FALSE AND (dl IS NULL OR dl <= $2)
+               ORDER BY dl NULLS LAST, start_time NULLS LAST, id DESC LIMIT 12""",
+            user_id, today
+        )
+        workouts = await conn.fetch(
+            """SELECT date, muscle, exercise, sets, reps, weight
+               FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC LIMIT 40""",
+            user_id
+        )
+        food = await conn.fetch(
+            """SELECT date, meal_type, food_name, serving_desc, calories, protein, fat, carbs
+               FROM food_log WHERE user_id=$1 ORDER BY date DESC, created_at DESC LIMIT 40""",
+            user_id
+        )
+
+    profile = {}
+    if settings:
+        profile = {
+            "goal": settings["goal"],
+            "age": settings["age"],
+            "height": float(settings["height"]) if settings["height"] is not None else None,
+            "weight": float(settings["weight"]) if settings["weight"] is not None else None,
+            "target_weight": float(settings["target_weight"]) if settings["target_weight"] is not None else None,
+            "activity": settings["activity"],
+            "calorie_goal": settings["calorie_goal"],
+            "workout_groups": settings["workout_groups"] or DEFAULT_WORKOUT_GROUPS,
+        }
+
+    prompt = f"""Ты продуктовый ИИ-планировщик внутри фитнес-планера.
+Собери реалистичный план на сегодня на русском языке. Учитывай цель, невыполненные задачи, историю питания и тренировок.
+
+ПРОФИЛЬ:
+{json.dumps(profile, ensure_ascii=False, default=str)}
+
+НЕЗАВЕРШЕННЫЕ ЗАДАЧИ:
+{json.dumps([dict(r) for r in tasks], ensure_ascii=False, default=str)}
+
+ПОСЛЕДНИЕ ТРЕНИРОВКИ:
+{json.dumps([dict(r) for r in workouts], ensure_ascii=False, default=str)}
+
+ПОСЛЕДНЕЕ ПИТАНИЕ:
+{json.dumps([dict(r) for r in food], ensure_ascii=False, default=str)}
+
+Верни ТОЛЬКО валидный JSON без markdown:
+{{
+  "title": "короткое название плана",
+  "summary": "1-2 предложения, почему такой план",
+  "tasks": [
+    {{"text":"конкретная задача", "prio":"h|m|l", "cat":"Фокус|Питание|Тренировка|Восстановление|Работа|Личное", "duration_minutes":30}}
+  ],
+  "nutrition": [
+    {{"meal":"завтрак|обед|ужин|перекус", "idea":"что съесть/подготовить", "reason":"зачем"}}
+  ],
+  "workout": {{
+    "recommended": true,
+    "group": "название группы или отдых",
+    "focus": "цель тренировки или восстановления",
+    "exercises": ["упражнение 1", "упражнение 2", "упражнение 3"]
+  }},
+  "recovery": ["короткая рекомендация 1", "короткая рекомендация 2"]
+}}
+
+Ограничения: tasks максимум 5, nutrition максимум 4, exercises максимум 5. Не назначай тяжелую тренировку, если по истории она была вчера или сегодня. Если данных мало, сделай мягкий базовый план."""
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "max_tokens": 1400,
+                    "temperature": 0.35,
+                    "messages": [
+                        {"role": "system", "content": "Ты аккуратный ИИ-планировщик. Отвечай только валидным JSON без markdown."},
+                        {"role": "user", "content": prompt}
+                    ]
+                }
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"].strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            plan = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"AI returned invalid JSON: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, f"AI error: {str(e)}")
+
+    plan["generated_at"] = datetime.now(TZ).isoformat()
+    return plan
+
+
 # ════════════════════════════════════════════════════════════════
 # EXPORT
 # ════════════════════════════════════════════════════════════════
