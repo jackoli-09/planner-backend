@@ -1611,6 +1611,100 @@ async def ai_day_plan(user_id: int = Depends(authenticated_user)):
     return plan
 
 
+@app.get("/api/ai/exercise-advice")
+async def ai_exercise_advice(
+    exercise: str,
+    muscle: Optional[str] = None,
+    user_id: int = Depends(authenticated_user)
+):
+    """Советует, какие упражнения поставить в комплекс вокруг выбранного движения."""
+    await ensure_user_settings(user_id)
+    exercise = (exercise or "").strip()[:120]
+    muscle = (muscle or "").strip()[:120]
+    if not exercise:
+        raise HTTPException(422, "exercise is required")
+    if not GROQ_API_KEY:
+        raise HTTPException(503, "AI not configured")
+
+    async with pool.acquire() as conn:
+        settings = await conn.fetchrow("SELECT workout_groups, goal FROM user_settings WHERE user_id=$1", user_id)
+        selected_history = await conn.fetch(
+            """SELECT date, muscle, exercise, sets, reps, weight,
+                      ROUND(weight * (1 + reps::numeric/30), 1) as orm
+               FROM workouts
+               WHERE user_id=$1 AND lower(exercise)=lower($2)
+               ORDER BY date DESC, id DESC LIMIT 12""",
+            user_id, exercise
+        )
+        recent_workouts = await conn.fetch(
+            """SELECT date, muscle, exercise, sets, reps, weight
+               FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC LIMIT 30""",
+            user_id
+        )
+
+    workout_groups = DEFAULT_WORKOUT_GROUPS
+    if settings and settings["workout_groups"]:
+        workout_groups = settings["workout_groups"]
+
+    prompt = f"""Ты тренер внутри фитнес-планера. Пользователь выбрал упражнение: {exercise}.
+Текущая группа/сплит: {muscle or "не указана"}.
+Цель пользователя: {settings["goal"] if settings else "maintain"}.
+
+ГРУППЫ ПОЛЬЗОВАТЕЛЯ:
+{json.dumps(workout_groups, ensure_ascii=False, default=str)}
+
+ИСТОРИЯ ЭТОГО УПРАЖНЕНИЯ:
+{json.dumps([dict(r) for r in selected_history], ensure_ascii=False, default=str)}
+
+ПОСЛЕДНИЕ ТРЕНИРОВКИ:
+{json.dumps([dict(r) for r in recent_workouts], ensure_ascii=False, default=str)}
+
+Верни ТОЛЬКО валидный JSON без markdown:
+{{
+  "summary": "1-2 предложения: как лучше использовать упражнение в комплексе",
+  "companion_exercises": ["упражнение 1", "упражнение 2", "упражнение 3", "упражнение 4"],
+  "sets_reps": "короткая схема подходов и повторений",
+  "progression": "как прогрессировать в следующих тренировках",
+  "caution": "короткое предупреждение по перегрузке/технике"
+}}
+
+Ограничения: не советуй больше 5 упражнений. Не ставь в один комплекс слишком много тяжелых базовых движений. Учитывай, если выбранное упражнение уже тяжелое."""
+
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "max_tokens": 900,
+                    "temperature": 0.35,
+                    "messages": [
+                        {"role": "system", "content": "Ты аккуратный силовой тренер. Отвечай только валидным JSON без markdown."},
+                        {"role": "user", "content": prompt}
+                    ]
+                }
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"].strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            advice = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"AI returned invalid JSON: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, f"AI error: {str(e)}")
+
+    advice["exercise"] = exercise
+    advice["generated_at"] = datetime.now(TZ).isoformat()
+    return advice
+
+
 # ════════════════════════════════════════════════════════════════
 # EXPORT
 # ════════════════════════════════════════════════════════════════
