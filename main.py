@@ -79,6 +79,14 @@ class WorkoutGroupItem(BaseModel):
 class WorkoutGroupsIn(BaseModel):
     groups: list[WorkoutGroupItem] = Field(min_length=1, max_length=24)
 
+class WorkoutProgramDay(BaseModel):
+    weekday: int = Field(ge=0, le=6)
+    rest: bool = False
+    group: Optional[str] = Field(default=None, max_length=80)
+
+class WorkoutProgramIn(BaseModel):
+    days: list[WorkoutProgramDay] = Field(min_length=7, max_length=7)
+
 class TaskIn(BaseModel):
     id: str
     text: str
@@ -490,6 +498,7 @@ async def init_db():
                 calorie_goal INT,
                 onboarding_completed BOOLEAN DEFAULT FALSE,
                 workout_groups JSONB,
+                active_workout_program JSONB,
                 seeded_defaults BOOLEAN DEFAULT FALSE,
                 updated_at TIMESTAMPTZ DEFAULT now()
             );
@@ -531,6 +540,7 @@ async def init_db():
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS calorie_goal INT")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS workout_groups JSONB")
+        await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS active_workout_program JSONB")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS notif_tasks TEXT DEFAULT '20:00'")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS notif_tasks_on BOOLEAN DEFAULT TRUE")
         await conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS notif_weekly TEXT DEFAULT '19:00'")
@@ -924,6 +934,36 @@ async def save_workout_groups(
             RETURNING workout_groups, updated_at
         """, user_id, json.dumps(groups, ensure_ascii=False))
     return {"workout_groups": parse_times(row["workout_groups"]), "updated_at": row["updated_at"]}
+
+
+@app.post("/api/settings/workout-program")
+async def save_workout_program(
+    payload: "WorkoutProgramIn",
+    user_id: int = Depends(authenticated_user),
+):
+    await ensure_user_settings(user_id)
+    seen = set()
+    program = []
+    for day in sorted(payload.days, key=lambda item: item.weekday):
+        if day.weekday in seen:
+            continue
+        seen.add(day.weekday)
+        group = str(day.group or "").strip()
+        rest = bool(day.rest or not group)
+        program.append({
+            "weekday": day.weekday,
+            "rest": rest,
+            "group": None if rest else group[:80],
+        })
+    if len(program) != 7 or seen != set(range(7)):
+        raise HTTPException(422, "Program must include weekdays 0-6")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE user_settings SET active_workout_program=$2::jsonb, updated_at=now()
+            WHERE user_id=$1
+            RETURNING active_workout_program, updated_at
+        """, user_id, json.dumps(program, ensure_ascii=False))
+    return {"active_workout_program": parse_times(row["active_workout_program"]), "updated_at": row["updated_at"]}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1539,6 +1579,7 @@ async def ai_day_plan(user_id: int = Depends(authenticated_user)):
             "activity": settings["activity"],
             "calorie_goal": settings["calorie_goal"],
             "workout_groups": settings["workout_groups"] or DEFAULT_WORKOUT_GROUPS,
+            "active_workout_program": settings["active_workout_program"],
         }
 
     prompt = f"""Ты продуктовый ИИ-планировщик внутри фитнес-планера.
@@ -1725,7 +1766,8 @@ async def export_all(user_id: int = Depends(authenticated_user)):
         settings = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id=$1", user_id)
 
     profile_keys = ["name", "goal", "sex", "age", "height", "weight", "target_weight",
-                    "activity", "calorie_goal", "onboarding_completed", "updated_at"]
+                    "activity", "calorie_goal", "onboarding_completed", "workout_groups",
+                    "active_workout_program", "updated_at"]
     notification_keys = ["notif_morning", "notif_morning_on", "notif_workout", "notif_workout_on",
                          "notif_evening", "notif_evening_on", "notif_tasks", "notif_tasks_on",
                          "notif_weekly", "notif_weekly_on", "timezone", "updated_at"]
