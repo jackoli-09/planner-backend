@@ -33,6 +33,10 @@ ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get(
     "https://planner-frontend-sable.vercel.app,https://jackoli-09.github.io,http://127.0.0.1:8134,http://localhost:8134"
 ).split(",") if origin.strip()]
 TZ = ZoneInfo("Europe/Moscow")
+IS_SERVERLESS = bool(os.environ.get("VERCEL"))
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+# Supabase pooler (порт 6543, transaction mode) не поддерживает prepared statements
+USE_DB_POOLER = ":6543/" in DATABASE_URL or os.environ.get("DB_POOLER", "").lower() == "true"
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", str(90 * 24 * 60 * 60)))
 
 pool: Optional[asyncpg.Pool] = None
@@ -203,13 +207,23 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("DATABASE_URL is required for persistent product storage")
     if ALLOW_INSECURE_DEMO and APP_ENV not in {"development", "test"}:
         raise RuntimeError("ALLOW_INSECURE_DEMO is forbidden outside development and test")
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, command_timeout=30)
+    pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=0 if IS_SERVERLESS else 1,
+        max_size=3 if IS_SERVERLESS else 10,
+        command_timeout=30,
+        statement_cache_size=0 if USE_DB_POOLER else 100,
+    )
     await init_db()
-    telegram_menu_configured = await configure_telegram_menu_button()
-    # Запускаем планировщик уведомлений
-    task = asyncio.create_task(notification_scheduler())
+    task = None
+    if not IS_SERVERLESS:
+        # Постоянный сервер: меню бота при старте и фоновая рассылка.
+        # В serverless (Vercel) это делает /api/cron/notifications по расписанию.
+        telegram_menu_configured = await configure_telegram_menu_button()
+        task = asyncio.create_task(notification_scheduler())
     yield
-    task.cancel()
+    if task:
+        task.cancel()
     await pool.close()
 
 
@@ -698,82 +712,108 @@ async def claim_notification(user_id: int, kind: str, scheduled_key: str) -> boo
     return bool(claimed)
 
 
+def scheduled_due(value, now: datetime, window_minutes: int) -> bool:
+    """Время HH:MM наступило в последние window_minutes минут (по часовому поясу now)."""
+    try:
+        hour, minute = map(int, str(value)[:5].split(":"))
+    except (TypeError, ValueError):
+        return False
+    scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    elapsed = (now - scheduled).total_seconds()
+    return 0 <= elapsed < window_minutes * 60
+
+
+async def run_notifications_tick(now_utc: Optional[datetime] = None, window_minutes: int = 1) -> int:
+    """Один проход рассылки. Повторы защищены claim_notification (ключ = дата + время)."""
+    async with pool.acquire() as conn:
+        users = await conn.fetch("SELECT * FROM user_settings")
+    for u in users:
+        try:
+            await notify_user(u, now_utc, window_minutes)
+        except Exception as e:
+            logging.error("Notification error for user %s: %s", u["user_id"], e)
+    return len(users)
+
+
+async def notify_user(u, now_utc: Optional[datetime], window_minutes: int):
+    uid = u["user_id"]
+    try:
+        user_tz = ZoneInfo(u["timezone"] or "Europe/Moscow")
+    except Exception:
+        user_tz = TZ
+    now = (now_utc or datetime.now(ZoneInfo("UTC"))).astimezone(user_tz)
+    current_weekday = now.weekday()
+
+    def due(value) -> bool:
+        return scheduled_due(value, now, window_minutes)
+
+    def key(value) -> str:
+        return f"{now.date().isoformat()}T{value}"
+    
+    # Утренние добавки
+    if (u["notif_morning_on"] and due(u["notif_morning"])
+            and await claim_notification(uid, "supplements_morning", key(u["notif_morning"]))):
+        async with pool.acquire() as conn:
+            supps = await conn.fetch(
+                "SELECT name FROM supplements WHERE user_id=$1 AND times::text ILIKE '%утро%'", uid
+            )
+        if supps:
+            names = ", ".join(html.escape(s["name"]) for s in supps[:3])
+            await send_telegram(uid, "☀️ <b>Доброе утро!</b>\n\nНе забудь принять добавки: " + names)
+    
+    # Напоминание о тренировке
+    if (u["notif_workout_on"] and due(u["notif_workout"])
+            and await claim_notification(uid, "workout", key(u["notif_workout"]))):
+        # Проверяем был ли уже подход сегодня
+        async with pool.acquire() as conn:
+            today_workouts = await conn.fetchval(
+                "SELECT COUNT(*) FROM workouts WHERE user_id=$1 AND date=$2",
+                uid, now.date()
+            )
+        if today_workouts == 0:
+            days = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+            splits = {0:"Ноги 🦵",1:"Грудь + Трицепс 💪",3:"Спина + Бицепс 🏋️",4:"Плечи 🎯"}
+            workout_today = splits.get(current_weekday, "Тренировка")
+            await send_telegram(uid, "💪 <b>Сегодня " + days[current_weekday] + "</b>\n\n" + workout_today + " — не пропусти!")
+    
+    # Вечерние добавки
+    if (u["notif_evening_on"] and due(u["notif_evening"])
+            and await claim_notification(uid, "supplements_evening", key(u["notif_evening"]))):
+        async with pool.acquire() as conn:
+            supps = await conn.fetch(
+                "SELECT name FROM supplements WHERE user_id=$1 AND times::text ILIKE '%вечер%'", uid
+            )
+        if supps:
+            names = ", ".join(html.escape(s["name"]) for s in supps[:3])
+            await send_telegram(uid, "🌙 <b>Вечерние добавки</b>\n\nПора принять: " + names + "\n\nХорошего сна!")
+
+    # Незавершенные задачи
+    if (u["notif_tasks_on"] and due(u["notif_tasks"])
+            and await claim_notification(uid, "tasks", key(u["notif_tasks"]))):
+        async with pool.acquire() as conn:
+            remaining = await conn.fetchval(
+                "SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND done=FALSE AND (dl IS NULL OR dl<=$2)",
+                uid, now.date()
+            )
+        if remaining:
+            await send_telegram(
+                uid,
+                f"📋 <b>Осталось задач: {remaining}</b>\n\nЗакрой главное или перенеси дела на другой день."
+            )
+    
+    # Еженедельный отчёт — воскресенье 19:00
+    if (u["notif_weekly_on"] and current_weekday == 6 and due(u["notif_weekly"])
+            and await claim_notification(uid, "weekly_report", key(u["notif_weekly"]))):
+        await send_weekly_report(uid)
+
+
 async def notification_scheduler():
-    """Планировщик — каждую минуту проверяет нужно ли слать уведомления."""
+    """Фоновый режим для постоянного сервера (Railway/VPS): проход раз в минуту."""
     logging.info("Notification scheduler started")
     while True:
         try:
-            await asyncio.sleep(60)  # проверяем каждую минуту
-            async with pool.acquire() as conn:
-                users = await conn.fetch("SELECT * FROM user_settings")
-            
-            for u in users:
-                uid = u["user_id"]
-                try:
-                    user_tz = ZoneInfo(u["timezone"] or "Europe/Moscow")
-                except Exception:
-                    user_tz = TZ
-                now = datetime.now(user_tz)
-                current_time = now.strftime("%H:%M")
-                current_weekday = now.weekday()
-                delivery_key = now.strftime("%Y-%m-%dT%H:%M")
-                
-                # Утренние добавки
-                if (u["notif_morning_on"] and u["notif_morning"] == current_time
-                        and await claim_notification(uid, "supplements_morning", delivery_key)):
-                    async with pool.acquire() as conn:
-                        supps = await conn.fetch(
-                            "SELECT name FROM supplements WHERE user_id=$1 AND times::text ILIKE '%утро%'", uid
-                        )
-                    if supps:
-                        names = ", ".join(html.escape(s["name"]) for s in supps[:3])
-                        await send_telegram(uid, "☀️ <b>Доброе утро!</b>\n\nНе забудь принять добавки: " + names)
-                
-                # Напоминание о тренировке
-                if (u["notif_workout_on"] and u["notif_workout"] == current_time
-                        and await claim_notification(uid, "workout", delivery_key)):
-                    # Проверяем был ли уже подход сегодня
-                    async with pool.acquire() as conn:
-                        today_workouts = await conn.fetchval(
-                            "SELECT COUNT(*) FROM workouts WHERE user_id=$1 AND date=$2",
-                            uid, now.date()
-                        )
-                    if today_workouts == 0:
-                        days = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
-                        splits = {0:"Ноги 🦵",1:"Грудь + Трицепс 💪",3:"Спина + Бицепс 🏋️",4:"Плечи 🎯"}
-                        workout_today = splits.get(current_weekday, "Тренировка")
-                        await send_telegram(uid, "💪 <b>Сегодня " + days[current_weekday] + "</b>\n\n" + workout_today + " — не пропусти!")
-                
-                # Вечерние добавки
-                if (u["notif_evening_on"] and u["notif_evening"] == current_time
-                        and await claim_notification(uid, "supplements_evening", delivery_key)):
-                    async with pool.acquire() as conn:
-                        supps = await conn.fetch(
-                            "SELECT name FROM supplements WHERE user_id=$1 AND times::text ILIKE '%вечер%'", uid
-                        )
-                    if supps:
-                        names = ", ".join(html.escape(s["name"]) for s in supps[:3])
-                        await send_telegram(uid, "🌙 <b>Вечерние добавки</b>\n\nПора принять: " + names + "\n\nХорошего сна!")
-
-                # Незавершенные задачи
-                if (u["notif_tasks_on"] and u["notif_tasks"] == current_time
-                        and await claim_notification(uid, "tasks", delivery_key)):
-                    async with pool.acquire() as conn:
-                        remaining = await conn.fetchval(
-                            "SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND done=FALSE AND (dl IS NULL OR dl<=$2)",
-                            uid, now.date()
-                        )
-                    if remaining:
-                        await send_telegram(
-                            uid,
-                            f"📋 <b>Осталось задач: {remaining}</b>\n\nЗакрой главное или перенеси дела на другой день."
-                        )
-                
-                # Еженедельный отчёт — воскресенье 19:00
-                if (u["notif_weekly_on"] and current_weekday == 6 and current_time == u["notif_weekly"]
-                        and await claim_notification(uid, "weekly_report", delivery_key)):
-                    await send_weekly_report(uid)
-        
+            await asyncio.sleep(60)
+            await run_notifications_tick(window_minutes=2)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -838,6 +878,18 @@ async def health():
     except Exception as e:
         logging.exception("Healthcheck failed")
         raise HTTPException(503, f"Database unavailable: {type(e).__name__}")
+
+
+@app.post("/api/cron/notifications")
+async def cron_notifications(authorization: Optional[str] = Header(None, alias="Authorization")):
+    """Внешний планировщик (GitHub Actions) дёргает раз в ~10 минут."""
+    global telegram_menu_configured
+    if not CRON_SECRET or not hmac.compare_digest(authorization or "", f"Bearer {CRON_SECRET}"):
+        raise HTTPException(401, "Invalid cron secret")
+    if not telegram_menu_configured:
+        telegram_menu_configured = await configure_telegram_menu_button()
+    users = await run_notifications_tick(window_minutes=30)
+    return {"status": "ok", "users": users}
 
 
 @app.post("/api/auth/session")

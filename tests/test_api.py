@@ -151,3 +151,46 @@ def test_delete_account_removes_everything(client):
     assert r.json()["rows"]["tasks"] == 1
     assert client.get("/api/tasks", headers=tg(uid)).json() == []
     assert len(client.get("/api/tasks", headers=tg(other)).json()) == 1
+
+
+# ── Уведомления ─────────────────────────────────────────────────
+from datetime import datetime  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+
+def test_scheduled_due_window():
+    msk = ZoneInfo("Europe/Moscow")
+    now = datetime(2026, 9, 25, 9, 7, tzinfo=msk)
+    assert main.scheduled_due("09:00", now, 10)
+    assert not main.scheduled_due("09:00", now, 5)
+    assert not main.scheduled_due("09:10", now, 30)  # ещё не наступило
+    assert not main.scheduled_due("bad", now, 30)
+
+
+def test_cron_requires_secret(client):
+    assert client.post("/api/cron/notifications").status_code == 401
+    assert client.post("/api/cron/notifications", headers={"Authorization": "Bearer nope"}).status_code == 401
+
+
+def test_cron_sends_once_per_day(client, monkeypatch):
+    uid = new_user()
+    client.get("/api/tasks", headers=tg(uid))  # создаёт user_settings
+    client.post("/api/tasks", json=task("t-" + uuid.uuid4().hex), headers=tg(uid))
+    now = datetime.now(ZoneInfo("Europe/Moscow"))
+    past = now.replace(minute=(now.minute // 5) * 5, second=0).strftime("%H:%M")
+    r = client.post("/api/settings/notifications", headers=tg(uid), json={
+        "notif_morning_on": False, "notif_workout_on": False, "notif_evening_on": False,
+        "notif_weekly_on": False, "notif_tasks_on": True, "notif_tasks": past,
+        "timezone": "Europe/Moscow",
+    })
+    assert r.status_code == 200, r.text
+    sent = []
+
+    async def fake_send(user_id, text):
+        sent.append(user_id)
+    monkeypatch.setattr(main, "send_telegram", fake_send)
+    monkeypatch.setattr(main, "CRON_SECRET", "s3cret")
+    for _ in range(2):  # повторный запуск cron не должен дублировать сообщение
+        r = client.post("/api/cron/notifications", headers={"Authorization": "Bearer s3cret"})
+        assert r.status_code == 200
+    assert sent.count(uid) == 1

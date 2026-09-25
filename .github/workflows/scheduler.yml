@@ -1,0 +1,34 @@
+# Каждые 10 минут: запускает рассылку напоминаний (/api/cron/notifications)
+# и проверяет, что сервис жив. При сбое пишет владельцу в Telegram.
+# Секреты репозитория: CRON_SECRET, BOT_TOKEN, OWNER_CHAT_ID (ваш Telegram user id).
+# Переменная репозитория (необязательно): API_URL, по умолчанию домен фронтенда.
+name: scheduler
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    env:
+      API_URL: ${{ vars.API_URL || 'https://planner-frontend-sable.vercel.app' }}
+    steps:
+      - name: Run notifications tick
+        id: tick
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          code=$(curl -s -o body.txt -w "%{http_code}" --max-time 60 -X POST \
+            -H "Authorization: Bearer ${CRON_SECRET}" "$API_URL/api/cron/notifications" || echo 000)
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "HTTP $code"; head -c 300 body.txt || true
+      - name: Alert owner
+        if: steps.tick.outputs.code != '200'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=⚠️ Планировщик: сервер ответил HTTP ${{ steps.tick.outputs.code }} на $API_URL"
+          exit 1
