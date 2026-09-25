@@ -1,0 +1,27 @@
+# Каждые 15 минут проверяет /api/health и пишет владельцу в Telegram, если сервис лежит.
+# Нужны секреты репозитория: BOT_TOKEN и OWNER_CHAT_ID (ваш Telegram user id).
+name: uptime
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check health
+        id: check
+        run: |
+          code=$(curl -s -o body.txt -w "%{http_code}" --max-time 20 https://planner-frontend-sable.vercel.app/api/health || echo 000)
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "HTTP $code"; head -c 300 body.txt || true
+      - name: Alert owner
+        if: steps.check.outputs.code != '200'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=⚠️ Планировщик: /api/health ответил HTTP ${{ steps.check.outputs.code }}. https://railway.com/dashboard"
+          exit 1

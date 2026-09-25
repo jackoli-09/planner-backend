@@ -1,0 +1,31 @@
+# Ежедневный зашифрованный бэкап PostgreSQL в артефакты GitHub (хранятся 30 дней).
+# Репозиторий публичный, поэтому дамп шифруется: без BACKUP_PASSPHRASE его не прочитать.
+# Секреты: DATABASE_URL, BACKUP_PASSPHRASE.
+# Восстановление: gpg -d backup.sql.gz.gpg | gunzip | psql "$DATABASE_URL"
+name: backup
+on:
+  schedule:
+    - cron: "30 0 * * *"   # 03:30 МСК
+  workflow_dispatch:
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-16 || sudo apt-get install -y -qq postgresql-client
+      - name: Dump and encrypt
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$PASSPHRASE"
+          pg_dump --no-owner --no-privileges "$DATABASE_URL" | gzip -9 > backup.sql.gz
+          test $(stat -c%s backup.sql.gz) -gt 1000
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$PASSPHRASE" -c backup.sql.gz
+          rm backup.sql.gz
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: planner-db-${{ github.run_id }}
+          path: backup.sql.gz.gpg
+          retention-days: 30

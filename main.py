@@ -1790,6 +1790,31 @@ async def export_all(user_id: int = Depends(authenticated_user)):
     }
 
 
+USER_DATA_TABLES = (
+    "workouts", "tasks", "task_templates", "supplements", "supplement_checks",
+    "body_weight", "body_calories", "body_measures", "food_log", "food_favorites",
+    "notification_deliveries", "user_settings", "users",
+)
+
+
+@app.delete("/api/account")
+async def delete_account(
+    confirm: str = Header("", alias="X-Confirm-Delete"),
+    user_id: int = Depends(authenticated_user),
+):
+    """Полное удаление всех данных пользователя (право на удаление ПДн)."""
+    if confirm != "DELETE":
+        raise HTTPException(400, "Send header X-Confirm-Delete: DELETE to confirm")
+    deleted = {}
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for table in USER_DATA_TABLES:
+                result = await conn.execute(f"DELETE FROM {table} WHERE user_id=$1", user_id)
+                deleted[table] = int(result.split()[-1])
+    logging.info("Account deleted: user_id=%s rows=%s", user_id, sum(deleted.values()))
+    return {"status": "deleted", "rows": deleted}
+
+
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "planner-api"}
