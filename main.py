@@ -84,6 +84,8 @@ class WorkoutIn(BaseModel):
     sets: int
     reps: int
     weight: float
+    rpe: Optional[float] = Field(default=None, ge=1, le=10)
+    note: Optional[str] = Field(default=None, max_length=200)
 
 class WorkoutGroupItem(BaseModel):
     name: str = Field(min_length=1, max_length=80)
@@ -584,6 +586,8 @@ async def init_db():
         await conn.execute("ALTER TABLE food_log ADD COLUMN IF NOT EXISTS client_id TEXT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_food_log_user_client ON food_log(user_id, client_id) WHERE client_id IS NOT NULL")
         await conn.execute("ALTER TABLE workouts ADD COLUMN IF NOT EXISTS client_id TEXT")
+        await conn.execute("ALTER TABLE workouts ADD COLUMN IF NOT EXISTS rpe NUMERIC")
+        await conn.execute("ALTER TABLE workouts ADD COLUMN IF NOT EXISTS note TEXT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_workouts_user_client ON workouts(user_id, client_id) WHERE client_id IS NOT NULL")
         await conn.execute("ALTER TABLE supplements ADD COLUMN IF NOT EXISTS client_id TEXT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_supplements_user_client ON supplements(user_id, client_id) WHERE client_id IS NOT NULL")
@@ -641,7 +645,7 @@ async def fetch_user_state(user_id: int) -> dict:
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         workouts = await conn.fetch(
-            "SELECT id, client_id, date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC",
+            "SELECT id, client_id, date, muscle, exercise, sets, reps, weight, rpe, note FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC",
             user_id
         )
         tasks = await conn.fetch(
@@ -1076,7 +1080,7 @@ async def get_workouts(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, client_id, date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC",
+            "SELECT id, client_id, date, muscle, exercise, sets, reps, weight, rpe, note FROM workouts WHERE user_id=$1 ORDER BY date DESC, id DESC",
             user_id
         )
         return [dict(r) for r in rows]
@@ -1087,12 +1091,13 @@ async def add_workout(w: "WorkoutIn", user_id: int = Depends(authenticated_user)
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO workouts (user_id, client_id, date, muscle, exercise, sets, reps, weight)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            INSERT INTO workouts (user_id, client_id, date, muscle, exercise, sets, reps, weight, rpe, note)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT (user_id, client_id) WHERE client_id IS NOT NULL
-            DO UPDATE SET date=$3, muscle=$4, exercise=$5, sets=$6, reps=$7, weight=$8
+            DO UPDATE SET date=$3, muscle=$4, exercise=$5, sets=$6, reps=$7, weight=$8, rpe=$9, note=$10
             RETURNING id
-        """, user_id, w.client_id, w.date, w.muscle, w.exercise, w.sets, w.reps, w.weight)
+        """, user_id, w.client_id, w.date, w.muscle, w.exercise, w.sets, w.reps, w.weight,
+             w.rpe, (w.note or "").strip() or None)
     return {"status": "ok", "id": row["id"]}
 
 
@@ -1855,7 +1860,7 @@ async def ai_exercise_advice(
 async def export_all(user_id: int = Depends(authenticated_user)):
     await ensure_user_settings(user_id)
     async with pool.acquire() as conn:
-        workouts = await conn.fetch("SELECT date, muscle, exercise, sets, reps, weight FROM workouts WHERE user_id=$1", user_id)
+        workouts = await conn.fetch("SELECT date, muscle, exercise, sets, reps, weight, rpe, note FROM workouts WHERE user_id=$1", user_id)
         tasks = await conn.fetch("SELECT id, text, prio, dl, cat, done, start_time, duration_minutes, repeat_rule FROM tasks WHERE user_id=$1", user_id)
         task_templates = await conn.fetch("SELECT client_id, name, tasks FROM task_templates WHERE user_id=$1", user_id)
         supps = await conn.fetch("SELECT name, emoji, dose, times FROM supplements WHERE user_id=$1", user_id)

@@ -274,3 +274,14 @@ def test_old_v1_session_rejected(client):
     sig = _b64.urlsafe_b64encode(_hm.new(BOT_TOKEN.encode(), payload.encode(), _h.sha256).digest()).decode().rstrip("=")
     r = client.get("/api/tasks", headers={"Authorization": f"Bearer {payload}:{sig}"})
     assert r.status_code == 401
+
+
+def test_workout_rpe_and_note_roundtrip(client):
+    uid = new_user()
+    body = {"client_id": "w-" + uuid.uuid4().hex, "date": "2026-10-03", "muscle": "Грудь", "exercise": "Жим",
+            "sets": 1, "reps": 5, "weight": 100, "rpe": 8.5, "note": "  пауза внизу  "}
+    assert client.post("/api/workouts", json=body, headers=tg(uid)).status_code == 200
+    w = client.get("/api/workouts", headers=tg(uid)).json()[0]
+    assert float(w["rpe"]) == 8.5 and w["note"] == "пауза внизу"
+    bad = dict(body, client_id="w-x", rpe=11)
+    assert client.post("/api/workouts", json=bad, headers=tg(uid)).status_code == 422
