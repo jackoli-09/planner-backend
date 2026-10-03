@@ -11,7 +11,7 @@ import hashlib
 import hmac
 import html
 import time as unix_time
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Literal, Optional
 from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
@@ -35,6 +35,8 @@ ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get(
 TZ = ZoneInfo("Europe/Moscow")
 IS_SERVERLESS = bool(os.environ.get("VERCEL"))
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
+# Владелец продукта: получает отзывы и видит статистику. Telegram user id.
+OWNER_USER_ID = int(os.environ.get("OWNER_USER_ID", "0") or 0)
 # Supabase pooler (порт 6543, transaction mode) не поддерживает prepared statements
 USE_DB_POOLER = ":6543/" in DATABASE_URL or os.environ.get("DB_POOLER", "").lower() == "true"
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", str(90 * 24 * 60 * 60)))
@@ -517,6 +519,19 @@ async def init_db():
                 updated_at TIMESTAMPTZ DEFAULT now()
             );
 
+            CREATE TABLE IF NOT EXISTS user_activity_days (
+                user_id BIGINT NOT NULL,
+                day DATE NOT NULL,
+                PRIMARY KEY (user_id, day)
+            );
+
+            CREATE TABLE IF NOT EXISTS feedback (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+
             CREATE TABLE IF NOT EXISTS notification_deliveries (
                 user_id BIGINT NOT NULL,
                 kind TEXT NOT NULL,
@@ -575,6 +590,11 @@ async def ensure_user_settings(user_id: int):
             INSERT INTO users (user_id) VALUES ($1)
             ON CONFLICT (user_id) DO UPDATE SET last_seen_at=now()
         """, user_id)
+        # Активный день для метрик удержания: только факт входа, без содержимого записей.
+        await conn.execute(
+            "INSERT INTO user_activity_days (user_id, day) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+            user_id, datetime.now(TZ).date()
+        )
         settings = await conn.fetchrow("""
             INSERT INTO user_settings (user_id) VALUES ($1)
             ON CONFLICT (user_id) DO UPDATE SET updated_at=user_settings.updated_at
@@ -732,6 +752,10 @@ async def run_notifications_tick(now_utc: Optional[datetime] = None, window_minu
             await notify_user(u, now_utc, window_minutes)
         except Exception as e:
             logging.error("Notification error for user %s: %s", u["user_id"], e)
+    try:
+        await send_owner_digest(now_utc)
+    except Exception as e:
+        logging.error("Owner digest error: %s", e)
     return len(users)
 
 
@@ -905,7 +929,9 @@ async def create_auth_session(
 
 @app.get("/api/bootstrap")
 async def bootstrap(user_id: int = Depends(authenticated_user)):
-    return await fetch_user_state(user_id)
+    state = await fetch_user_state(user_id)
+    state["is_owner"] = bool(OWNER_USER_ID) and user_id == OWNER_USER_ID
+    return state
 
 
 @app.post("/api/settings/profile")
@@ -1842,10 +1868,99 @@ async def export_all(user_id: int = Depends(authenticated_user)):
     }
 
 
+class FeedbackIn(BaseModel):
+    text: str = Field(min_length=2, max_length=2000)
+
+
+@app.post("/api/feedback")
+async def send_feedback(f: FeedbackIn, user_id: int = Depends(authenticated_user)):
+    await ensure_user_settings(user_id)
+    text = f.text.strip()
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO feedback (user_id, text) VALUES ($1,$2)", user_id, text)
+    if OWNER_USER_ID:
+        await send_telegram(OWNER_USER_ID, "💬 <b>Отзыв о планировщике</b>\n\n" + html.escape(text[:1500]))
+    return {"status": "ok"}
+
+
+async def product_stats() -> dict:
+    today = datetime.now(TZ).date()
+    async with pool.acquire() as conn:
+        firsts = await conn.fetch("SELECT user_id, MIN(day) AS first_day FROM user_activity_days GROUP BY user_id")
+        days = await conn.fetch("SELECT user_id, day FROM user_activity_days WHERE day >= $1", today - timedelta(days=120))
+        usage = {}
+        for table in ("tasks", "workouts", "food_log", "body_weight", "supplement_checks"):
+            usage[table] = await conn.fetchval(f"SELECT COUNT(DISTINCT user_id) FROM {table}")
+        feedback_count = await conn.fetchval("SELECT COUNT(*) FROM feedback")
+    first_day = {r["user_id"]: r["first_day"] for r in firsts}
+    active = {}
+    for r in days:
+        active.setdefault(r["user_id"], set()).add(r["day"])
+
+    def active_between(days_set, start, end):
+        return any(start <= d <= end for d in days_set)
+
+    def retention(offset_from: int, offset_to: int) -> dict:
+        # Доля пользователей, вернувшихся в окне [first+from, first+to]; только созревшие когорты.
+        eligible = [u for u, f in first_day.items() if f + timedelta(days=offset_to) <= today]
+        returned = [u for u in eligible if active_between(active.get(u, set()),
+                    first_day[u] + timedelta(days=offset_from), first_day[u] + timedelta(days=offset_to))]
+        return {"eligible": len(eligible), "returned": len(returned),
+                "rate": round(len(returned) / len(eligible), 3) if eligible else None}
+
+    def active_last(n):
+        return sum(1 for s in active.values() if any(d > today - timedelta(days=n) for d in s))
+
+    return {
+        "date": today.isoformat(),
+        "users_total": len(first_day),
+        "new_7d": sum(1 for f in first_day.values() if f > today - timedelta(days=7)),
+        "active_1d": active_last(1), "active_7d": active_last(7), "active_30d": active_last(30),
+        "retention_d1": retention(1, 1),
+        "retention_d7": retention(7, 13),
+        "retention_d30": retention(30, 59),
+        "feature_users": usage,
+        "feedback_total": feedback_count,
+    }
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(user_id: int = Depends(authenticated_user)):
+    if not OWNER_USER_ID or user_id != OWNER_USER_ID:
+        raise HTTPException(403, "Only the product owner can see stats")
+    return await product_stats()
+
+
+def format_stats(st: dict) -> str:
+    def pct(r):
+        return "—" if r["rate"] is None else f"{round(r['rate'] * 100)}% ({r['returned']}/{r['eligible']})"
+    fu = st["feature_users"]
+    return (
+        "📊 <b>Планировщик: неделя</b>\n\n"
+        f"Пользователей: {st['users_total']} (новых за 7 дн.: {st['new_7d']})\n"
+        f"Активных: день {st['active_1d']} · неделя {st['active_7d']} · месяц {st['active_30d']}\n"
+        f"Удержание D1: {pct(st['retention_d1'])}\nD7: {pct(st['retention_d7'])}\nD30: {pct(st['retention_d30'])}\n\n"
+        f"Пользуются: тренировки {fu['workouts']}, питание {fu['food_log']}, задачи {fu['tasks']}, "
+        f"вес {fu['body_weight']}, добавки {fu['supplement_checks']}\n"
+        f"Отзывов всего: {st['feedback_total']}"
+    )
+
+
+async def send_owner_digest(now_utc: Optional[datetime] = None):
+    """Понедельник 10:00 МСК: сводка метрик владельцу (один раз в неделю)."""
+    if not OWNER_USER_ID:
+        return
+    now = (now_utc or datetime.now(ZoneInfo("UTC"))).astimezone(TZ)
+    if now.weekday() != 0 or not scheduled_due("10:00", now, 30):
+        return
+    if await claim_notification(OWNER_USER_ID, "owner_digest", now.date().isoformat()):
+        await send_telegram(OWNER_USER_ID, format_stats(await product_stats()))
+
+
 USER_DATA_TABLES = (
     "workouts", "tasks", "task_templates", "supplements", "supplement_checks",
     "body_weight", "body_calories", "body_measures", "food_log", "food_favorites",
-    "notification_deliveries", "user_settings", "users",
+    "notification_deliveries", "user_activity_days", "feedback", "user_settings", "users",
 )
 
 

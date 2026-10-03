@@ -194,3 +194,64 @@ def test_cron_sends_once_per_day(client, monkeypatch):
         r = client.post("/api/cron/notifications", headers={"Authorization": "Bearer s3cret"})
         assert r.status_code == 200
     assert sent.count(uid) == 1
+
+
+# ── Продуктовые метрики и отзывы ────────────────────────────────
+def test_activity_day_recorded_and_deleted(client):
+    import asyncio
+    uid = new_user()
+    client.get("/api/bootstrap", headers=tg(uid))
+
+    async def count():
+        async with main.pool.acquire() as conn:
+            return await conn.fetchval("SELECT COUNT(*) FROM user_activity_days WHERE user_id=$1", uid)
+    assert client.portal.call(count) == 1
+    client.delete("/api/account", headers=tg(uid) | {"X-Confirm-Delete": "DELETE"})
+    assert client.portal.call(count) == 0
+
+
+def test_bootstrap_owner_flag(client, monkeypatch):
+    owner, other = new_user(), new_user()
+    monkeypatch.setattr(main, "OWNER_USER_ID", owner)
+    assert client.get("/api/bootstrap", headers=tg(owner)).json()["is_owner"] is True
+    assert client.get("/api/bootstrap", headers=tg(other)).json()["is_owner"] is False
+
+
+def test_stats_only_for_owner(client, monkeypatch):
+    owner, other = new_user(), new_user()
+    monkeypatch.setattr(main, "OWNER_USER_ID", owner)
+    assert client.get("/api/admin/stats", headers=tg(other)).status_code == 403
+    r = client.get("/api/admin/stats", headers=tg(owner))
+    assert r.status_code == 200
+    st = r.json()
+    assert st["users_total"] >= 1 and "retention_d7" in st
+    assert "Удержание" in main.format_stats(st)
+
+
+def test_feedback_forwarded_to_owner(client, monkeypatch):
+    owner, uid = new_user(), new_user()
+    monkeypatch.setattr(main, "OWNER_USER_ID", owner)
+    sent = []
+
+    async def fake_send(user_id, text):
+        sent.append((user_id, text))
+    monkeypatch.setattr(main, "send_telegram", fake_send)
+    r = client.post("/api/feedback", json={"text": "Добавьте таймер <отдыха>"}, headers=tg(uid))
+    assert r.status_code == 200
+    assert sent and sent[0][0] == owner and "&lt;отдыха&gt;" in sent[0][1]
+    assert client.post("/api/feedback", json={"text": ""}, headers=tg(uid)).status_code == 422
+
+
+def test_retention_counts_returning_user(client):
+    from datetime import timedelta
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date()
+    uid = new_user()
+
+    async def seed_and_stats():
+        async with main.pool.acquire() as conn:
+            for offset in (40, 32):  # пришёл 40 дней назад, вернулся на 8-й день
+                await conn.execute("INSERT INTO user_activity_days VALUES ($1,$2) ON CONFLICT DO NOTHING",
+                                   uid, today - timedelta(days=offset))
+        return await main.product_stats()
+    st = client.portal.call(seed_and_stats)
+    assert st["retention_d7"]["eligible"] >= 1 and st["retention_d7"]["returned"] >= 1
