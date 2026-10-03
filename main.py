@@ -34,6 +34,14 @@ ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get(
 ).split(",") if origin.strip()]
 TZ = ZoneInfo("Europe/Moscow")
 IS_SERVERLESS = bool(os.environ.get("VERCEL"))
+# Сессии подписываются отдельным ключом, а не самим BOT_TOKEN.
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "")
+
+
+def session_signing_key() -> bytes:
+    if SESSION_SECRET:
+        return SESSION_SECRET.encode()
+    return hmac.new(BOT_TOKEN.encode(), b"planner-session-v2", hashlib.sha256).digest()
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 # Владелец продукта: получает отзывы и видит статистику. Telegram user id.
 OWNER_USER_ID = int(os.environ.get("OWNER_USER_ID", "0") or 0)
@@ -306,8 +314,8 @@ def create_session_token(user_id: int, ttl_seconds: int = SESSION_TTL_SECONDS) -
     if not BOT_TOKEN:
         raise HTTPException(503, "Telegram authentication is not configured")
     expires_at = int(unix_time.time()) + ttl_seconds
-    payload = f"v1:{user_id}:{expires_at}"
-    signature = hmac.new(BOT_TOKEN.encode(), payload.encode(), hashlib.sha256).digest()
+    payload = f"v2:{user_id}:{expires_at}"
+    signature = hmac.new(session_signing_key(), payload.encode(), hashlib.sha256).digest()
     encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
     return f"{payload}:{encoded_signature}", expires_at
 
@@ -319,10 +327,10 @@ def verify_session_token(token: str) -> int:
         version, raw_user_id, raw_expires_at, received_signature = token.split(":", 3)
         user_id = int(raw_user_id)
         expires_at = int(raw_expires_at)
-        if version != "v1" or user_id <= 0 or expires_at <= int(unix_time.time()):
+        if version != "v2" or user_id <= 0 or expires_at <= int(unix_time.time()):
             raise HTTPException(401, "Session has expired")
         payload = f"{version}:{user_id}:{expires_at}"
-        signature = hmac.new(BOT_TOKEN.encode(), payload.encode(), hashlib.sha256).digest()
+        signature = hmac.new(session_signing_key(), payload.encode(), hashlib.sha256).digest()
         expected_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
         if not hmac.compare_digest(expected_signature, received_signature):
             raise HTTPException(401, "Invalid session")
@@ -795,10 +803,9 @@ async def notify_user(u, now_utc: Optional[datetime], window_minutes: int):
                 uid, now.date()
             )
         if today_workouts == 0:
-            days = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
-            splits = {0:"Ноги 🦵",1:"Грудь + Трицепс 💪",3:"Спина + Бицепс 🏋️",4:"Плечи 🎯"}
-            workout_today = splits.get(current_weekday, "Тренировка")
-            await send_telegram(uid, "💪 <b>Сегодня " + days[current_weekday] + "</b>\n\n" + workout_today + " — не пропусти!")
+            text = workout_reminder_text(u["active_workout_program"], current_weekday)
+            if text:
+                await send_telegram(uid, text)
     
     # Вечерние добавки
     if (u["notif_evening_on"] and due(u["notif_evening"])
@@ -829,6 +836,23 @@ async def notify_user(u, now_utc: Optional[datetime], window_minutes: int):
     if (u["notif_weekly_on"] and current_weekday == 6 and due(u["notif_weekly"])
             and await claim_notification(uid, "weekly_report", key(u["notif_weekly"]))):
         await send_weekly_report(uid)
+
+
+WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+
+def workout_reminder_text(program_raw, python_weekday: int) -> Optional[str]:
+    """Текст напоминания по недельной программе пользователя.
+    В программе weekday — как в JS getDay() (0 = воскресенье). None = день отдыха."""
+    day_name = WEEKDAYS_RU[python_weekday]
+    js_weekday = (python_weekday + 1) % 7
+    program = parse_times(program_raw) if program_raw else []
+    plan = next((d for d in program if isinstance(d, dict) and d.get("weekday") == js_weekday), None)
+    if plan is None:
+        return f"💪 <b>Сегодня {day_name}</b>\n\nВремя тренировки — не пропусти!"
+    if plan.get("rest") or not plan.get("group"):
+        return None
+    return f"💪 <b>Сегодня {day_name}: {html.escape(str(plan['group']))}</b>\n\nОткрой планировщик и запиши первый подход."
 
 
 async def notification_scheduler():

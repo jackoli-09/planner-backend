@@ -255,3 +255,22 @@ def test_retention_counts_returning_user(client):
         return await main.product_stats()
     st = client.portal.call(seed_and_stats)
     assert st["retention_d7"]["eligible"] >= 1 and st["retention_d7"]["returned"] >= 1
+
+
+def test_workout_reminder_uses_user_program():
+    import json as _json
+    program = [{"weekday": d, "rest": d != 1, "group": "Грудь + Трицепс" if d == 1 else None} for d in range(7)]
+    raw = _json.dumps(program, ensure_ascii=False)
+    monday = main.workout_reminder_text(raw, 0)  # JS weekday 1
+    assert "Грудь + Трицепс" in monday and "понедельник" in monday
+    assert main.workout_reminder_text(raw, 1) is None  # вторник — отдых
+    assert "вторник" in main.workout_reminder_text(None, 1)  # без программы — общее напоминание
+
+
+def test_old_v1_session_rejected(client):
+    import base64 as _b64, hashlib as _h, hmac as _hm, time as _t
+    uid = new_user()
+    payload = f"v1:{uid}:{int(_t.time()) + 3600}"
+    sig = _b64.urlsafe_b64encode(_hm.new(BOT_TOKEN.encode(), payload.encode(), _h.sha256).digest()).decode().rstrip("=")
+    r = client.get("/api/tasks", headers={"Authorization": f"Bearer {payload}:{sig}"})
+    assert r.status_code == 401
