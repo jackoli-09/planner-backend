@@ -22,7 +22,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+def resolve_database_url() -> str:
+    """DATABASE_URL, либо переменные, которые создаёт интеграция Supabase ↔ Vercel.
+    Из строки убираются параметры, которых не понимает asyncpg (например supa=...)."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    raw = (os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+           or os.environ.get("POSTGRES_PRISMA_URL") or "")
+    if not raw:
+        return ""
+    parts = urlsplit(raw)
+    query = [(k, v) for k, v in parse_qsl(parts.query) if k in {"sslmode", "sslrootcert", "options"}]
+    scheme = "postgresql" if parts.scheme in {"postgres", "postgresql"} else parts.scheme
+    return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query), ""))
+
+
+DATABASE_URL = resolve_database_url()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://planner-frontend-sable.vercel.app")

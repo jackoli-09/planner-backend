@@ -285,3 +285,12 @@ def test_workout_rpe_and_note_roundtrip(client):
     assert float(w["rpe"]) == 8.5 and w["note"] == "пауза внизу"
     bad = dict(body, client_id="w-x", rpe=11)
     assert client.post("/api/workouts", json=bad, headers=tg(uid)).status_code == 422
+
+
+def test_resolve_database_url_from_supabase_integration(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("POSTGRES_URL", "postgres://u:p@aws-0-eu.pooler.supabase.com:6543/postgres?sslmode=require&supa=base-pooler.x")
+    url = main.resolve_database_url()
+    assert url == "postgresql://u:p@aws-0-eu.pooler.supabase.com:6543/postgres?sslmode=require"
+    monkeypatch.setenv("DATABASE_URL", "postgresql://a:b@h:5432/db")
+    assert main.resolve_database_url() == "postgresql://a:b@h:5432/db"
