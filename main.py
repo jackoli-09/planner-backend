@@ -61,7 +61,7 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "")
 # Владелец продукта: получает отзывы и видит статистику. Telegram user id.
 OWNER_USER_ID = int(os.environ.get("OWNER_USER_ID", "0") or 0)
 # Supabase pooler (порт 6543, transaction mode) не поддерживает prepared statements
-USE_DB_POOLER = ":6543/" in DATABASE_URL or os.environ.get("DB_POOLER", "").lower() == "true"
+USE_DB_POOLER = ":6543/" in DATABASE_URL or "-pooler." in DATABASE_URL or os.environ.get("DB_POOLER", "").lower() == "true"
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", str(90 * 24 * 60 * 60)))
 
 pool: Optional[asyncpg.Pool] = None
@@ -239,7 +239,7 @@ async def lifespan(app: FastAPI):
         min_size=0 if IS_SERVERLESS else 1,
         max_size=3 if IS_SERVERLESS else 10,
         command_timeout=30,
-        statement_cache_size=0 if USE_DB_POOLER else 100,
+        statement_cache_size=0 if (USE_DB_POOLER or IS_SERVERLESS) else 100,
     )
     await init_db()
     task = None
