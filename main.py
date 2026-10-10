@@ -38,7 +38,8 @@ def resolve_database_url() -> str:
 
 DATABASE_URL = resolve_database_url()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = (os.environ.get("BOT_TOKEN") or os.environ.get("TGBOT")
+             or os.environ.get("tgbot") or "").strip()
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://planner-frontend-sable.vercel.app")
 ALLOW_INSECURE_DEMO = os.environ.get("ALLOW_INSECURE_DEMO", "false").lower() == "true"
 APP_ENV = os.environ.get("APP_ENV", "production").lower()
