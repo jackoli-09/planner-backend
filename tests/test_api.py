@@ -294,3 +294,68 @@ def test_resolve_database_url_from_supabase_integration(monkeypatch):
     assert url == "postgresql://u:p@aws-0-eu.pooler.supabase.com:6543/postgres?sslmode=require"
     monkeypatch.setenv("DATABASE_URL", "postgresql://a:b@h:5432/db")
     assert main.resolve_database_url() == "postgresql://a:b@h:5432/db"
+
+
+# ── Планировщик через OIDC GitHub, ежедневный бэкап, отчёты об ошибках ──
+
+def _oidc_setup(monkeypatch):
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()))
+    jwk.update(kid="test-kid", alg="RS256", use="sig")
+
+    async def keys(force=False):
+        return [jwk]
+    monkeypatch.setattr(main, "github_oidc_keys", keys)
+    monkeypatch.setattr(main, "CRON_SECRET", "")
+
+    def token(repo="jackoli-09/planner-backend", aud="planner-backend"):
+        now = int(time.time())
+        claims = {"iss": main.GITHUB_OIDC_ISSUER, "aud": aud, "repository": repo, "iat": now, "exp": now + 300}
+        return jwt.encode(claims, key, algorithm="RS256", headers={"kid": "test-kid"})
+    return token
+
+
+def test_cron_accepts_github_oidc_from_own_repo(client, monkeypatch):
+    token = _oidc_setup(monkeypatch)
+    r = client.post("/api/cron/notifications", headers={"Authorization": f"Bearer {token()}"})
+    assert r.status_code == 200, r.text
+
+
+def test_cron_rejects_other_repo_wrong_audience_and_missing_token(client, monkeypatch):
+    token = _oidc_setup(monkeypatch)
+    assert client.post("/api/cron/notifications", headers={"Authorization": f"Bearer {token(repo='evil/fork')}"}).status_code == 403
+    assert client.post("/api/cron/notifications", headers={"Authorization": f"Bearer {token(aud='other')}"}).status_code == 401
+    assert client.post("/api/cron/notifications").status_code == 401
+
+
+def test_daily_cron_sends_one_backup_per_day(client, monkeypatch):
+    owner = new_user()
+    sent = []
+
+    async def fake_doc(user_id, filename, content, caption):
+        import gzip
+        sent.append((user_id, filename, json.loads(gzip.decompress(content))))
+        return True
+    monkeypatch.setattr(main, "OWNER_USER_ID", owner)
+    monkeypatch.setattr(main, "CRON_SECRET", "")
+    monkeypatch.setattr(main, "send_telegram_document", fake_doc)
+    assert client.get("/api/cron/daily").json()["backup"] == "sent"
+    assert client.get("/api/cron/daily").json()["backup"] == "skipped"
+    assert len(sent) == 1 and sent[0][0] == owner
+    assert "tasks" in sent[0][2]["tables"]
+
+
+def test_client_error_is_stored_and_owner_notified_once(client, monkeypatch):
+    owner = new_user()
+    messages = []
+
+    async def fake_send(user_id, text):
+        messages.append((user_id, text))
+    monkeypatch.setattr(main, "OWNER_USER_ID", owner)
+    monkeypatch.setattr(main, "send_telegram", fake_send)
+    body = {"message": f"TypeError: x is undefined {uuid.uuid4().hex[:6]}", "stack": "at renderFoo (index.html:10:5)", "app_version": "v47"}
+    for _ in range(3):
+        assert client.post("/api/client-errors", json=body).status_code == 200
+    assert len(messages) == 1 and "TypeError" in messages[0][1]

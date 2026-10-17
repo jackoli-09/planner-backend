@@ -17,7 +17,8 @@ from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
 import asyncpg
-from fastapi import Depends, FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
@@ -58,6 +59,11 @@ def session_signing_key() -> bytes:
         return SESSION_SECRET.encode()
     return hmac.new(BOT_TOKEN.encode(), b"planner-session-v2", hashlib.sha256).digest()
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
+# Планировщик в GitHub Actions подтверждает себя OIDC-токеном GitHub — без общих секретов.
+CRON_GITHUB_REPOS = {r.strip().lower() for r in os.environ.get(
+    "CRON_GITHUB_REPOS", "jackoli-09/planner-backend").split(",") if r.strip()}
+CRON_OIDC_AUDIENCE = os.environ.get("CRON_OIDC_AUDIENCE", "planner-backend")
+GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 # Владелец продукта: получает отзывы и видит статистику. Telegram user id.
 OWNER_USER_ID = int(os.environ.get("OWNER_USER_ID", "0") or 0)
 # Supabase pooler (порт 6543, transaction mode) не поддерживает prepared statements
@@ -557,6 +563,20 @@ async def init_db():
                 created_at TIMESTAMPTZ DEFAULT now()
             );
 
+            CREATE TABLE IF NOT EXISTS client_errors (
+                id BIGSERIAL PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'client',
+                user_id BIGINT,
+                message TEXT NOT NULL,
+                stack TEXT,
+                url TEXT,
+                user_agent TEXT,
+                app_version TEXT,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS client_errors_fp_idx ON client_errors (fingerprint, created_at);
+
             CREATE TABLE IF NOT EXISTS notification_deliveries (
                 user_id BIGINT NOT NULL,
                 kind TEXT NOT NULL,
@@ -947,12 +967,57 @@ async def health():
         raise HTTPException(503, f"Database unavailable: {type(e).__name__}")
 
 
+_github_jwks: dict = {"keys": None, "fetched": 0.0}
+
+
+async def github_oidc_keys(force: bool = False):
+    if force or not _github_jwks["keys"] or unix_time.time() - _github_jwks["fetched"] > 3600:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(GITHUB_OIDC_ISSUER + "/.well-known/jwks")
+            response.raise_for_status()
+            _github_jwks["keys"] = response.json().get("keys", [])
+            _github_jwks["fetched"] = unix_time.time()
+    return _github_jwks["keys"]
+
+
+async def verify_github_oidc(token: str) -> dict:
+    """Проверяет OIDC-токен GitHub Actions: подпись, издатель, аудитория и репозиторий."""
+    import jwt  # PyJWT
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Invalid cron token")
+    for attempt in (False, True):
+        keys = await github_oidc_keys(force=attempt)
+        jwk = next((k for k in keys if k.get("kid") == header.get("kid")), None)
+        if jwk:
+            break
+    else:
+        raise HTTPException(401, "Unknown signing key")
+    try:
+        claims = jwt.decode(token, jwt.PyJWK(jwk).key, algorithms=["RS256"],
+                            audience=CRON_OIDC_AUDIENCE, issuer=GITHUB_OIDC_ISSUER)
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Invalid cron token")
+    if str(claims.get("repository", "")).lower() not in CRON_GITHUB_REPOS:
+        raise HTTPException(403, "Repository is not allowed")
+    return claims
+
+
+async def require_cron_caller(authorization: Optional[str]):
+    token = (authorization or "")[7:].strip() if (authorization or "").startswith("Bearer ") else ""
+    if not token:
+        raise HTTPException(401, "Missing cron token")
+    if CRON_SECRET and hmac.compare_digest(token, CRON_SECRET):
+        return
+    await verify_github_oidc(token)
+
+
 @app.post("/api/cron/notifications")
 async def cron_notifications(authorization: Optional[str] = Header(None, alias="Authorization")):
     """Внешний планировщик (GitHub Actions) дёргает раз в ~10 минут."""
     global telegram_menu_configured
-    if not CRON_SECRET or not hmac.compare_digest(authorization or "", f"Bearer {CRON_SECRET}"):
-        raise HTTPException(401, "Invalid cron secret")
+    await require_cron_caller(authorization)
     if not telegram_menu_configured:
         telegram_menu_configured = await configure_telegram_menu_button()
     users = await run_notifications_tick(window_minutes=30)
@@ -1914,6 +1979,136 @@ async def export_all(user_id: int = Depends(authenticated_user)):
 
 class FeedbackIn(BaseModel):
     text: str = Field(min_length=2, max_length=2000)
+
+
+# ── Ежедневное обслуживание: держит базу «бодрой» и шлёт бэкап владельцу ──
+
+async def database_snapshot() -> bytes:
+    """Все пользовательские таблицы в один gzip-JSON."""
+    import gzip
+    async with pool.acquire() as conn:
+        tables = [r["table_name"] for r in await conn.fetch("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name""")]
+        dump = {"created_at": datetime.utcnow().isoformat() + "Z", "tables": {}}
+        for table in tables:
+            rows = await conn.fetch(f'SELECT * FROM "{table}"')
+            dump["tables"][table] = [dict(r) for r in rows]
+    raw = json.dumps(dump, ensure_ascii=False, default=str).encode()
+    return gzip.compress(raw, 9)
+
+
+async def send_telegram_document(user_id: int, filename: str, content: bytes, caption: str) -> bool:
+    if not BOT_TOKEN:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                data={"chat_id": str(user_id), "caption": caption, "parse_mode": "HTML"},
+                files={"document": (filename, content, "application/gzip")})
+        return response.status_code == 200
+    except Exception as e:
+        logging.warning("Telegram document error: %s", e)
+        return False
+
+
+@app.get("/api/cron/daily")
+async def cron_daily(authorization: Optional[str] = Header(None, alias="Authorization")):
+    """Vercel Cron раз в сутки. Повторный вызов в тот же день ничего не делает."""
+    if CRON_SECRET and not hmac.compare_digest(authorization or "", f"Bearer {CRON_SECRET}"):
+        raise HTTPException(401, "Invalid cron secret")
+    async with pool.acquire() as conn:
+        await conn.fetchval("SELECT count(*) FROM users")
+    result = {"status": "ok", "backup": "skipped"}
+    today = datetime.now(TZ).date().isoformat()
+    if OWNER_USER_ID and await claim_notification(OWNER_USER_ID, "daily_backup", today):
+        snapshot = await database_snapshot()
+        sent = await send_telegram_document(
+            OWNER_USER_ID, f"planner-backup-{today}.json.gz", snapshot,
+            f"🗄 Резервная копия планировщика за {today} · {len(snapshot) // 1024} КБ")
+        result["backup"] = "sent" if sent else "failed"
+    return result
+
+
+# ── Ошибки: из приложения и с сервера, владельцу в Telegram (без спама) ──
+
+class ClientErrorIn(BaseModel):
+    message: str = Field(min_length=1, max_length=500)
+    stack: Optional[str] = Field(default=None, max_length=4000)
+    url: Optional[str] = Field(default=None, max_length=300)
+    app_version: Optional[str] = Field(default=None, max_length=40)
+
+
+_error_ip_hits: dict = {}
+
+
+async def record_error(source: str, message: str, stack: Optional[str], url: Optional[str],
+                       user_agent: Optional[str], app_version: Optional[str], user_id: Optional[int]):
+    first_frame = next((line.strip() for line in (stack or "").splitlines() if line.strip()), "")
+    fingerprint = hashlib.sha1(f"{source}|{message[:200]}|{first_frame[:200]}".encode()).hexdigest()[:16]
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO client_errors (fingerprint, source, user_id, message, stack, url, user_agent, app_version)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        """, fingerprint, source, user_id, message[:500], (stack or "")[:4000], (url or "")[:300],
+            (user_agent or "")[:300], (app_version or "")[:40])
+        seen_today = await conn.fetchval("""
+            SELECT count(*) FROM client_errors WHERE fingerprint = $1 AND created_at > now() - interval '1 day'
+        """, fingerprint)
+    if not OWNER_USER_ID:
+        return
+    hour_key = datetime.now(TZ).strftime("%Y-%m-%dT%H")
+    # одна и та же ошибка — не чаще раза в сутки; всего — не больше 5 сообщений в час
+    if await claim_notification(OWNER_USER_ID, "error:" + fingerprint, datetime.now(TZ).date().isoformat()):
+        for slot in range(5):
+            if await claim_notification(OWNER_USER_ID, "error_budget", f"{hour_key}#{slot}"):
+                where = "📱 приложение" if source == "client" else "🖥 сервер"
+                await send_telegram(OWNER_USER_ID,
+                    f"⚠️ <b>Ошибка</b> · {where}\n<code>{html.escape(message[:300])}</code>\n"
+                    + (f"<code>{html.escape(first_frame[:200])}</code>\n" if first_frame else "")
+                    + f"Версия: {html.escape(app_version or '—')} · за сутки: {seen_today}")
+                break
+
+
+@app.post("/api/client-errors")
+async def report_client_error(
+    payload: ClientErrorIn,
+    request: Request,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    user_agent: Optional[str] = Header(None, alias="User-Agent"),
+):
+    ip = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "?")).split(",")[0].strip()
+    minute = int(unix_time.time() // 60)
+    key = (ip, minute)
+    _error_ip_hits[key] = _error_ip_hits.get(key, 0) + 1
+    if len(_error_ip_hits) > 5000:
+        _error_ip_hits.clear()
+    if _error_ip_hits[key] > 10:
+        raise HTTPException(429, "Too many error reports")
+    user_id = None
+    if authorization and authorization.startswith("Bearer "):
+        try:
+            user_id = verify_session_token(authorization[7:].strip())
+        except HTTPException:
+            user_id = None
+    await record_error("client", payload.message, payload.stack, payload.url, user_agent, payload.app_version, user_id)
+    return {"status": "ok"}
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, exc: Exception):
+    import traceback
+    logging.exception("Unhandled error on %s", request.url.path)
+    try:
+        if pool is not None:
+            stack = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-4000:]
+            frames = [line for line in stack.splitlines() if line.strip().startswith('File "') and "main.py" in line]
+            await record_error("server", f"{request.method} {request.url.path}: {type(exc).__name__}: {exc}"[:500],
+                               (frames[-1] if frames else "") + "\n" + stack, request.url.path, None, "server", None)
+    except Exception:
+        logging.exception("Could not record server error")
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 @app.post("/api/feedback")

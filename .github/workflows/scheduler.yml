@@ -1,34 +1,28 @@
-# Каждые 10 минут: запускает рассылку напоминаний (/api/cron/notifications)
-# и проверяет, что сервис жив. При сбое пишет владельцу в Telegram.
-# Секреты репозитория: CRON_SECRET, BOT_TOKEN, OWNER_CHAT_ID (ваш Telegram user id).
-# Переменная репозитория (необязательно): API_URL, по умолчанию домен фронтенда.
+# Каждые 10 минут запускает рассылку напоминаний (/api/cron/notifications).
+# Секреты не нужны: workflow подтверждает себя OIDC-токеном GitHub,
+# а сервер принимает токены только из этого репозитория.
+# Если сервер не ответил, запуск падает — GitHub пришлёт письмо владельцу репозитория.
 name: scheduler
 on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
 jobs:
   tick:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     env:
-      API_URL: ${{ vars.API_URL || 'https://planner-frontend-sable.vercel.app' }}
+      API_URL: ${{ vars.API_URL || 'https://planner-backend-three.vercel.app' }}
     steps:
       - name: Run notifications tick
-        id: tick
-        env:
-          CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
+          set -euo pipefail
+          TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=planner-backend" | python3 -c 'import sys,json; print(json.load(sys.stdin)["value"])')
           code=$(curl -s -o body.txt -w "%{http_code}" --max-time 60 -X POST \
-            -H "Authorization: Bearer ${CRON_SECRET}" "$API_URL/api/cron/notifications" || echo 000)
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "HTTP $code"; head -c 300 body.txt || true
-      - name: Alert owner
-        if: steps.tick.outputs.code != '200'
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=⚠️ Планировщик: сервер ответил HTTP ${{ steps.tick.outputs.code }} на $API_URL"
-          exit 1
+            -H "Authorization: Bearer $TOKEN" "$API_URL/api/cron/notifications" || echo 000)
+          echo "HTTP $code"; head -c 300 body.txt || true; echo
+          test "$code" = "200"
